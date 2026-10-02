@@ -24,7 +24,9 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(os.environ["HOME"], "bench")
 BTRFS_WORK = os.path.join(ROOT, "mount/bench")
-BIG = 8 << 20
+BIG = 512 << 20
+SMALL_LOCAL = 20000
+SMALL_CROSS = 4000
 REPS = 5
 
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
@@ -237,11 +239,12 @@ def main():
     for d in (src, d_r, d_c):
         rm_rf(d)
         os.makedirs(d)
-    mk_small(os.path.join(src, "small"), 300, 4 * 1024)
+    mk_small(os.path.join(src, "small"), SMALL_LOCAL, 4 * 1024)
     mk_big(os.path.join(src, "big"), "big.img", BIG)
-    print("fixture: %d small files, 512 MiB single file" % count_of(os.path.join(src, "small")))
+    print("fixture: %d small files, %d MiB single file"
+          % (count_of(os.path.join(src, "small")), BIG >> 20))
 
-    sweep(os.path.join(src, "small"), d_r, d_c, "small", 300, check_copy=True)
+    sweep(os.path.join(src, "small"), d_r, d_c, "small", SMALL_LOCAL, check_copy=True)
     sweep(os.path.join(src, "big"), d_r, d_c, "big", 1, check_copy=True)
 
     cut_bench("small", os.path.join(WORK, "cut_r"), os.path.join(WORK, "cut_c"))
@@ -255,11 +258,11 @@ def main():
     for d in (src, dr, dc):
         os.makedirs(d, exist_ok=True)
     mk_big(os.path.join(src, "x"), "big.img", BIG)
-    mk_small(os.path.join(src, "y"), 200, 4 * 1024)
+    mk_small(os.path.join(src, "y"), SMALL_CROSS, 4 * 1024)
     # The copy rows below are tmpfs to tmpfs: both clipboards are on $WORK, so
     # "cross-fs" describes the paste, not the copy.
-    sweep(os.path.join(src, "x"), dr, dc, "512M", 1)
-    sweep(os.path.join(src, "y"), dr, dc, "4k x200", 200)
+    sweep(os.path.join(src, "x"), dr, dc, "%dM" % (BIG >> 20), 1)
+    sweep(os.path.join(src, "y"), dr, dc, "4k x%d" % SMALL_CROSS, SMALL_CROSS)
 
     banner("cross-fs cut+paste: tmpfs -> btrfs")
     cut_bench("x", dr, dc)
@@ -273,7 +276,7 @@ def main():
     for impl in IMPLS:
         impl.use_clip(os.path.join(BTRFS_WORK, "rsstate" if impl is RS else "cbclip"))
     mk_big(bsrc, "big.img", BIG)
-    sweep(bsrc, dr, dc, "512M", 1)
+    sweep(bsrc, dr, dc, "%dM" % (BIG >> 20), 1)
 
     banner("retention: 5 copies in a row, nothing emptied in between")
     # The copy rows above empty the clipboard first, which is the only way to
