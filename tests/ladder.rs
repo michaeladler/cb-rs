@@ -1,0 +1,347 @@
+//! Integration checks for the copy ladder and the move path. Plain asserts, no
+//! framework: every case here corresponds to a way the C++ implementation loses
+//! or corrupts data.
+
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+
+use cb_rs::mover::{Outcome, move_into};
+use cb_rs::policy::Policy;
+use cb_rs::walk::{self, copy_any, remove_any};
+
+struct Sandbox {
+    root: PathBuf,
+}
+
+impl Sandbox {
+    fn new(name: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("cb-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+
+    fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
+        let path = self.path(name);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        // Copied trees may have arrived with read-only modes.
+        restore_modes(&self.root);
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn restore_modes(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() && !path.is_symlink() {
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+            restore_modes(&path);
+        }
+    }
+}
+
+fn mode_of(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().mode() & 0o777
+}
+
+#[test]
+fn copies_regular_file_byte_for_byte() {
+    let sandbox = Sandbox::new("regular");
+    let expected: Vec<u8> = (0..=255u8).cycle().take(100_000).collect();
+    sandbox.write("src.bin", &expected);
+    let dst = sandbox.path("dst.bin");
+
+    let failures = copy_any(&sandbox.path("src.bin"), &dst);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(fs::read(&dst).unwrap(), expected);
+}
+
+#[test]
+fn copies_a_large_file() {
+    let sandbox = Sandbox::new("large");
+    let data = vec![0xabu8; 3 * 1024 * 1024];
+    sandbox.write("big.bin", &data);
+    let dst = sandbox.path("big-copy.bin");
+
+    let failures = copy_any(&sandbox.path("big.bin"), &dst);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(fs::metadata(&dst).unwrap().len(), data.len() as u64);
+    assert_eq!(fs::read(&dst).unwrap(), data);
+}
+
+#[test]
+fn reproduces_symlinks_rather_than_their_targets() {
+    let sandbox = Sandbox::new("symlink");
+    sandbox.write("target.txt", b"payload");
+    symlink("target.txt", sandbox.path("link")).unwrap();
+    let dst = sandbox.path("copied-link");
+
+    let failures = copy_any(&sandbox.path("link"), &dst);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(fs::symlink_metadata(&dst).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_link(&dst).unwrap(), Path::new("target.txt"));
+    assert_eq!(
+        fs::metadata(&dst).unwrap().len(),
+        7,
+        "a symlink must not be copied as data"
+    );
+}
+
+#[test]
+fn reproduces_nested_directory_tree() {
+    let sandbox = Sandbox::new("tree");
+    let root = sandbox.path("tree");
+    fs::create_dir_all(root.join("a/b/c")).unwrap();
+    fs::write(root.join("a/b/c/deep.txt"), b"deep").unwrap();
+    fs::write(root.join("a/one.txt"), b"one").unwrap();
+    fs::write(root.join("top.txt"), b"top").unwrap();
+    let dst = sandbox.path("tree-copy");
+
+    let failures = copy_any(&root, &dst);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(fs::read(dst.join("top.txt")).unwrap(), b"top");
+    assert_eq!(fs::read(dst.join("a/one.txt")).unwrap(), b"one");
+    assert_eq!(fs::read(dst.join("a/b/c/deep.txt")).unwrap(), b"deep");
+}
+
+#[test]
+fn preserves_permission_bits() {
+    let sandbox = Sandbox::new("mode");
+    let src = sandbox.write("script.sh", b"#!/bin/sh\n");
+    fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+    let dst = sandbox.path("script-copy.sh");
+
+    let failures = copy_any(&src, &dst);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(mode_of(&dst), 0o750);
+}
+
+#[test]
+fn destination_is_never_an_alias_of_the_original() {
+    let sandbox = Sandbox::new("inode");
+    let src = sandbox.write("src.bin", &vec![7u8; 512 * 1024]);
+    let dst = sandbox.path("dst.bin");
+
+    let failures = copy_any(&src, &dst);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(fs::read(&src).unwrap(), fs::read(&dst).unwrap());
+    assert_ne!(
+        fs::metadata(&src).unwrap().ino(),
+        fs::metadata(&dst).unwrap().ino(),
+        "destination must be a separate inode, never a hardlink to the user's file"
+    );
+}
+
+/// The regression the C++ design is vulnerable to: it deletes originals after a
+/// copy it never re-verified. Here the source must survive a failed move.
+#[test]
+fn move_leaves_source_intact_when_the_copy_cannot_complete() {
+    let sandbox = Sandbox::new("move-verify");
+    let src = sandbox.write("keepme.txt", b"important");
+    let dst_dir = sandbox.path("dst");
+    fs::create_dir_all(&dst_dir).unwrap();
+    // A non-empty directory under the destination name cannot be replaced by a
+    // file copy, so the copy fails.
+    let blocked = dst_dir.join("keepme.txt");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("blocker"), b"x").unwrap();
+
+    let result = move_into(&src, &dst_dir, Policy::Replace);
+
+    assert!(
+        result.is_err(),
+        "a blocked destination must not report success"
+    );
+    assert_eq!(
+        fs::read(&src).unwrap(),
+        b"important",
+        "source must survive a failed move"
+    );
+}
+
+#[test]
+fn move_uses_rename_and_leaves_no_source() {
+    let sandbox = Sandbox::new("move-rename");
+    let src = sandbox.write("file.txt", b"contents");
+    let dst_dir = sandbox.path("dst");
+    fs::create_dir_all(&dst_dir).unwrap();
+
+    let outcome = move_into(&src, &dst_dir, Policy::Skip).unwrap();
+
+    assert!(matches!(outcome, Outcome::Moved));
+    assert_eq!(fs::read(dst_dir.join("file.txt")).unwrap(), b"contents");
+    assert!(!src.exists(), "source must be gone after a successful move");
+}
+
+#[test]
+fn move_skips_an_existing_destination_by_default() {
+    let sandbox = Sandbox::new("move-skip");
+    let src = sandbox.write("file.txt", b"source");
+    let dst_dir = sandbox.path("dst");
+    fs::create_dir_all(&dst_dir).unwrap();
+    fs::write(dst_dir.join("file.txt"), b"existing").unwrap();
+
+    let outcome = move_into(&src, &dst_dir, Policy::Skip).unwrap();
+
+    assert!(
+        matches!(outcome, Outcome::Skipped),
+        "default policy must not clobber an existing file"
+    );
+    assert_eq!(fs::read(dst_dir.join("file.txt")).unwrap(), b"existing");
+    assert_eq!(fs::read(&src).unwrap(), b"source");
+}
+
+#[test]
+fn move_replaces_when_policy_says_so() {
+    let sandbox = Sandbox::new("move-replace");
+    let src = sandbox.write("file.txt", b"source");
+    let dst_dir = sandbox.path("dst");
+    fs::create_dir_all(&dst_dir).unwrap();
+    fs::write(dst_dir.join("file.txt"), b"existing").unwrap();
+
+    let outcome = move_into(&src, &dst_dir, Policy::Replace).unwrap();
+
+    assert!(matches!(outcome, Outcome::Moved));
+    assert_eq!(fs::read(dst_dir.join("file.txt")).unwrap(), b"source");
+    assert!(!src.exists());
+}
+
+#[test]
+fn moves_a_directory_tree_intact() {
+    let sandbox = Sandbox::new("move-tree");
+    let root = sandbox.path("tree");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/inner.txt"), b"inner").unwrap();
+    let dst_dir = sandbox.path("dst");
+    fs::create_dir_all(&dst_dir).unwrap();
+
+    let outcome = move_into(&root, &dst_dir, Policy::Skip).unwrap();
+
+    assert!(matches!(outcome, Outcome::Moved));
+    assert_eq!(
+        fs::read(dst_dir.join("tree/sub/inner.txt")).unwrap(),
+        b"inner"
+    );
+    assert!(!root.exists());
+}
+
+/// A read-only source directory cannot be written into while it is copied, so
+/// the destination mode must be applied after its children are created.
+#[test]
+fn copies_a_read_only_directory() {
+    let sandbox = Sandbox::new("readonly-dir");
+    let root = sandbox.path("locked");
+    fs::create_dir_all(root.join("inner")).unwrap();
+    fs::write(root.join("inner/data.txt"), b"data").unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let failures = copy_any(&root, &sandbox.path("locked-copy"));
+
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(
+        fs::read(sandbox.path("locked-copy/inner/data.txt")).unwrap(),
+        b"data"
+    );
+    assert_eq!(mode_of(&sandbox.path("locked-copy")), 0o500);
+}
+
+#[test]
+fn reports_a_missing_source_instead_of_creating_an_empty_copy() {
+    let sandbox = Sandbox::new("missing");
+    let failures = copy_any(&sandbox.path("nope.txt"), &sandbox.path("out.txt"));
+
+    assert_eq!(
+        failures.len(),
+        1,
+        "missing source must be reported as a failure"
+    );
+    assert!(!sandbox.path("out.txt").exists());
+}
+
+#[test]
+fn empty_directory_survives_a_round_trip() {
+    let sandbox = Sandbox::new("empty-dir");
+    fs::create_dir_all(sandbox.path("nothing")).unwrap();
+    let dst = sandbox.path("nothing-copy");
+
+    let failures = copy_any(&sandbox.path("nothing"), &dst);
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(dst.is_dir());
+    assert_eq!(fs::read_dir(&dst).unwrap().count(), 0);
+}
+
+#[test]
+fn many_small_files_all_arrive() {
+    let sandbox = Sandbox::new("many");
+    let root = sandbox.path("many");
+    fs::create_dir_all(&root).unwrap();
+    for i in 0..500 {
+        fs::write(root.join(format!("f{i:04}.txt")), i.to_string()).unwrap();
+    }
+    let dst = sandbox.path("many-copy");
+
+    let failures = copy_any(&root, &dst);
+    assert!(
+        failures.is_empty(),
+        "{} failures, first {:?}",
+        failures.len(),
+        failures.first()
+    );
+    assert_eq!(fs::read_dir(&dst).unwrap().count(), 500);
+    assert_eq!(fs::read(dst.join("f0499.txt")).unwrap(), b"499");
+}
+
+#[test]
+fn remove_any_takes_a_whole_tree() {
+    let sandbox = Sandbox::new("remove");
+    let root = sandbox.path("doomed");
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/b/file.txt"), b"x").unwrap();
+    fs::write(root.join("top.txt"), b"y").unwrap();
+
+    remove_any(&root).unwrap();
+
+    assert!(!root.exists());
+}
+
+#[test]
+fn walker_reports_failures_instead_of_silently_skipping() {
+    let sandbox = Sandbox::new("unreadable");
+    let root = sandbox.path("tree");
+    fs::create_dir_all(root.join("locked")).unwrap();
+    fs::write(root.join("readable.txt"), b"fine").unwrap();
+    fs::write(root.join("locked/secret.txt"), b"hidden").unwrap();
+    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let failures = copy_any(&root, &sandbox.path("tree-copy"));
+
+    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !failures.is_empty(),
+        "an unreadable directory must be reported, not dropped"
+    );
+    assert_eq!(
+        fs::read(sandbox.path("tree-copy/readable.txt")).unwrap(),
+        b"fine"
+    );
+}
+
+#[test]
+fn walker_module_is_reachable() {
+    // Guards the module path the binary depends on.
+    let _: fn(&Path, &Path) -> Vec<walk::Failure> = walk::copy_any;
+}
