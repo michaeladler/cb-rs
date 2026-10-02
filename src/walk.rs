@@ -275,7 +275,7 @@ fn copy_regular(
         OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR,
     )?;
-    copy::clone_file(&src_fd, &dst_fd, st.st_size.max(0) as u64)?;
+    copy::clone_file(&src_fd, &dst_fd, &st)?;
     copy::preserve_mode(&dst_fd, Mode::from_raw_mode(st.st_mode))
 }
 
@@ -308,7 +308,7 @@ fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
         OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR,
     )?;
-    copy::clone_file(&src_fd, &dst_fd, st.st_size.max(0) as u64)?;
+    copy::clone_file(&src_fd, &dst_fd, &st)?;
     copy::preserve_mode(&dst_fd, Mode::from_raw_mode(st.st_mode))
 }
 

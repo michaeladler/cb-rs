@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use cb_rs::copy::{Method, clone_file};
 use cb_rs::walk;
 use rustix::fd::OwnedFd;
-use rustix::fs::{Mode, OFlags, open};
+use rustix::fs::{Mode, OFlags, fstat, open};
 use rustix::ioctl::{Opcode, Updater, opcode};
 
 const FICLONE: Opcode = opcode::write::<i32>(0x94, 9);
@@ -82,13 +82,14 @@ fn cow_dir() -> Option<PathBuf> {
     let clone = dir.join(format!(".cb-cow-probe-{tag}-clone"));
     fs::write(&probe, b"probe").ok()?;
     let src_fd = open(&probe, OFlags::RDONLY, Mode::empty()).ok()?;
+    let src_st = fstat(&src_fd).ok()?;
     let dst_fd = open(
         &clone,
         OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
         Mode::RUSR | Mode::WUSR,
     )
     .ok()?;
-    let verdict = clone_file(&src_fd, &dst_fd, 5).ok();
+    let verdict = clone_file(&src_fd, &dst_fd, &src_st).ok();
     drop(src_fd);
     drop(dst_fd);
     let _ = fs::remove_file(&probe);
@@ -121,14 +122,14 @@ impl Case {
     /// Copy through the ladder and report which rung paid off.
     fn clone(&self, src: &Path, dst_name: &str) -> Method {
         let src_fd = open(src, OFlags::RDONLY, Mode::empty()).unwrap();
-        let size = fs::metadata(src).unwrap().len();
+        let src_st = fstat(&src_fd).unwrap();
         let dst_fd: OwnedFd = open(
             self.path(dst_name),
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             Mode::RUSR | Mode::WUSR,
         )
         .unwrap();
-        clone_file(&src_fd, &dst_fd, size).unwrap()
+        clone_file(&src_fd, &dst_fd, &src_st).unwrap()
     }
 }
 
@@ -238,13 +239,14 @@ fn a_filesystem_without_reflinks_falls_through_to_a_correct_copy() {
 
     let method = {
         let src_fd = open(&src, OFlags::RDONLY, Mode::empty()).unwrap();
+        let src_st = fstat(&src_fd).unwrap();
         let dst_fd = open(
             &dst,
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             Mode::RUSR | Mode::WUSR,
         )
         .unwrap();
-        clone_file(&src_fd, &dst_fd, data.len() as u64).unwrap()
+        clone_file(&src_fd, &dst_fd, &src_st).unwrap()
     };
 
     assert_ne!(method, Method::Reflink);
@@ -269,6 +271,53 @@ fn the_walker_copy_also_reflinks() {
     assert!(failures.is_empty(), "{failures:?}");
     assert_eq!(fs::read(&dst).unwrap(), data);
     assert!(shared_with_source(&src, &dst));
+}
+
+/// A "this rung does not work here" answer is remembered per device *pair*, and
+/// two ways of getting that wrong are invisible until they are not: a plain
+/// flag lets a tmpfs file disable the rung for a btrfs destination in the same
+/// process, and a destination-only key does the same to the btrfs destination
+/// of a copy whose source sits on another mount.
+#[test]
+fn a_refused_reflink_does_not_leak_to_another_device() {
+    let plain = std::env::temp_dir().join(format!("cb-devkey-{}", std::process::id()));
+    fs::create_dir_all(&plain).unwrap();
+    let data = vec![0x33u8; 64 * 1024];
+    let src = plain.join("src.bin");
+    fs::write(&src, &data).unwrap();
+
+    let same_device_refusal = {
+        let src_fd = open(&src, OFlags::RDONLY, Mode::empty()).unwrap();
+        let src_st = fstat(&src_fd).unwrap();
+        let dst_fd = open(
+            &plain.join("first.bin"),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        clone_file(&src_fd, &dst_fd, &src_st).unwrap()
+    };
+    assert_ne!(
+        same_device_refusal,
+        Method::Reflink,
+        "the temp dir cannot reflink, and that has to be learned"
+    );
+    assert_eq!(fs::read(plain.join("first.bin")).unwrap(), data);
+
+    let Some(case) = Case::new("devkey") else {
+        eprintln!("skipping: no CoW volume (set CB_BTRFS_DIR)");
+        let _ = fs::remove_dir_all(&plain);
+        return;
+    };
+    // Source and destination both on the CoW volume, so `EXDEV` is not the
+    // answer here and the rung must still be reached.
+    let cow_src = case.write("cow-src.bin", &data);
+    assert_eq!(
+        case.clone(&cow_src, "second.bin"),
+        Method::Reflink,
+        "a rung refused for one device pair must still be tried for another"
+    );
+    let _ = fs::remove_dir_all(&plain);
 }
 
 /// Guards the opcode the rung depends on. A wrong value here compiles, runs,
