@@ -19,5 +19,5 @@ if [ ! -f "$image" ]; then
 fi
 
 mkdir -p "$mountpoint"
-sudo mount -o loop,compress=zstd "$image" "$mountpoint"
+sudo mount -o loop "$image" "$mountpoint"
 echo "mounted $image at $mountpoint"

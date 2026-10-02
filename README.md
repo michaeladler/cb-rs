@@ -52,7 +52,7 @@ whatever `CLIPBOARD_PERSISTDIR` points at. `<name>/data` holds the files,
 
 ## Benchmarks
 
-`scripts/bench.sh [reps]` compares `cb-rs` against `cb` 0.10.0 on copy, cut, and
+`scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 on copy, cut, and
 paste. It stages each clipboard next to the data it moves, so "same filesystem"
 means the same filesystem for both binaries, and it exercises three shapes:
 
@@ -82,7 +82,8 @@ Fixture: 20 000 files of 4 KiB across 200 directories, plus one 512 MiB file.
 
 ### Cross-filesystem: tmpfs → btrfs
 
-`./mount` is mounted `compress=zstd`, so every byte written there pays compression.
+`./mount` is a plain btrfs loop volume, no compression, so the cross-filesystem
+rows measure the copy path and nothing else.
 
 | op          | workload         | cb-rs           | cb               |
 |-------------|------------------|-----------------|------------------|
@@ -93,11 +94,10 @@ Fixture: 20 000 files of 4 KiB across 200 directories, plus one 512 MiB file.
 | cut + paste | 512 MiB move     | 3 + 1487 ms     | 145 + 1586 ms    |
 | cut + paste | 4 000 files move | 4 + 227 ms      | 68 + 182 ms      |
 
-The 512 MiB paste medians are dominated by zstd compression of the write and are
-wildly bimodal (mins of 202 and 1688 ms); read them as a tie. The 4 000-file move is
-`cb`'s one good cross-filesystem row: `cb-rs` fsyncs the destination before it
-unlinks the source, which is the price of not losing data when a copy comes up
-short.
+The 512 MiB paste medians were bimodal (mins of 202 and 1688 ms); read them as a
+tie. The 4 000-file move is `cb`'s one good cross-filesystem row: `cb-rs` fsyncs
+the destination before it unlinks the source, which is the price of not losing
+data when a copy comes up short.
 
 ### Reflink: btrfs → btrfs
 
