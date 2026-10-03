@@ -73,10 +73,18 @@ def pairs(lines):
 
 # ------------------------------------------------------------------ rendering
 
-def ratio(cb, rs):
-    if not cb or not rs:
+def ratio(p):
+    """cb / cb-rs, or a dash when the pair is incomplete. Takes the Pair rather
+    than two numbers because 0 is a real median -- it means the reps fell below
+    the clock's resolution, not that the row is missing -- and a falsy check
+    would swallow the biggest win the bench has."""
+    rs, cb = p.got.get(IMPLS[0]), p.got.get(IMPLS[1])
+    if rs is None or cb is None:
         return "&mdash;"
-    r = cb / rs
+    if rs[0] == 0:
+        # Both under the clock: nothing to divide, so nothing to claim.
+        return "&mdash;" if cb[0] == 0 else "&gt;%d&times;" % cb[0]
+    r = cb[0] / rs[0]
     return ("%.1f&times;" % r) if r < 10 else ("%d&times;" % r)
 
 
@@ -104,12 +112,9 @@ def table(entries, head=True):
     column labels on every cut+paste sub-block reads as a new dataset."""
     rows = []
     for p in entries:
-        got = p.got
-        rs, cb = got.get(IMPLS[0]), got.get(IMPLS[1])
-        speed = "<td>%s</td>" % ratio(cb[0], rs[0]) if rs and cb else "<td></td>"
-        rows.append("<tr><td>%s</td><td>%s</td>%s%s</tr>" % (
+        rows.append("<tr><td>%s</td><td>%s</td>%s<td>%s</td></tr>" % (
             html.escape(p.op), html.escape(p.workload),
-            "".join(cell(i, p) for i in IMPLS), speed))
+            "".join(cell(i, p) for i in IMPLS), ratio(p)))
     return "<table>%s<tbody>%s</tbody></table>" % (
         HEAD if head else "", "".join(rows))
 
@@ -193,7 +198,7 @@ a { color: inherit; }
 """
 
 
-def page(log, reps, date, sha, repo, runner):
+def page(log, *, reps, date, sha, repo, runner):
     return """<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -225,11 +230,11 @@ def main():
     with open(out, "w") as f:
         f.write(page(
             text,
-            os.environ.get("REPS", "5"),
-            datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-            html.escape(sha[:12]),
-            html.escape(repo).join(("https://github.com/", "/")),
-            html.escape("%s, %s cores" % (platform.platform(), os.cpu_count())),
+            reps=os.environ.get("REPS", "5"),
+            date=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            sha=html.escape(sha[:12]),
+            repo=html.escape(repo).join(("https://github.com/", "/")),
+            runner=html.escape("%s, %s cores" % (platform.platform(), os.cpu_count())),
         ))
 
 
