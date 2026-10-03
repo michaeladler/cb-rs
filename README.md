@@ -3,6 +3,8 @@
 
 # cb-rs
 
+[![demo](./demo/demo.gif)](./demo/demo.gif)
+
 A faster, safer Rust rewrite of [Clipboard](https://github.com/Slackadays/Clipboard) (`cb`), the cut/copy/paste tool for the command line.
 It is a drop-in for the copy/cut/paste workflow, not for `cb`'s text clipboard, history, or its other commands.
 

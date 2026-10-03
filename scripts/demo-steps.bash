@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#
+# Demo content for cb-rs. Run it through scripts/demo.sh, which records this
+# with asciinema and renders it with agg. Not meant to be run by hand: it is
+# non-interactive (NO_WAIT=true) and assumes an empty HOME with `cb` on PATH.
+#
+# demo-magic.sh comes from the demo-magic package (see devenv.nix). Override
+# the location with DEMO_MAGIC if it is not on PATH or in the nix store.
+
+source "${DEMO_MAGIC:-$(command -v demo-magic.sh || echo /nix/store/*/share/demo-magic.sh)}"
+
+TYPE_SPEED=15
+NO_WAIT=true
+SHOW_CMD_NUMS=true
+DEMO_PROMPT='\[\e[1;32m\]cb-demo\[\e[0m\]:\[\e[1;34m\]\W\[\e[0m\]\$ '
+
+# pe = print, type, execute. The sleeps are the only pacing: they hold the
+# frame long enough to read, since no one presses ENTER during a recording.
+hold() { sleep "${1:-1.6}"; }
+
+p "# a playground"
+pe "mkdir -p ~/demo/notes ~/demo/images/raw && cd ~/demo"
+hold
+pe "echo 'ship it' > notes/todo.md"
+pe "echo 'later' > notes/later.md"
+pe "head -c 8M /dev/urandom > images/raw/photo.bin"
+hold
+pe "ls -R"
+
+p "# copy: the originals stay put"
+pe "cb copy notes images"
+hold
+pe "cb list"
+
+p "# paste into a fresh directory"
+pe "mkdir -p out && cb paste -d out"
+hold
+pe "ls out images/raw"
+
+p "# a copy is not consumed, and the default conflict policy is skip"
+pe "cb paste -d out"
+hold 2.5
+
+p "# cut records paths, paste does the move"
+pe "cb cut out"
+hold
+pe "ls"
+hold
+pe "mkdir -p archive && cb paste -d archive"
+hold
+pe "ls"
+
+p "# nothing left in the clipboard"
+pe "cb list"
+hold 2.5
+
+# `pe` swallows the exit status of each step, so assert the end state here:
+# the recorder fails the run when this script exits non-zero.
+test -d ~/demo/archive && ! test -e ~/demo/out

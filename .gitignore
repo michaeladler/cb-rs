@@ -18,3 +18,4 @@ __pycache__
 
 # scripts/bench.py output; CI publishes it on the gh-pages branch
 bench.log
+*.cast
