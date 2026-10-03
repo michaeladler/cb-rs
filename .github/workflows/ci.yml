@@ -13,25 +13,37 @@ jobs:
   # XFS are the two CoW filesystems with different kernel FICLONE paths; ext4
   # is a real block filesystem with no reflink, so it exercises the fallthrough
   # and the cross-device move.
+  #
+  # macOS gets only `plain`: loop mounts and `mkfs` of these filesystems are not
+  # in reach on a hosted runner. It still earns its leg, because APFS is a CoW
+  # filesystem that has no FICLONE, so the ladder there must take the
+  # NOTTY/EOPNOTSUPP fallthrough all the way to the stream rung.
   test:
-    name: cargo test (${{ matrix.fs }})
-    runs-on: ubuntu-latest
+    name: cargo test (${{ matrix.os }}, ${{ matrix.fs }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - fs: plain
-          - fs: btrfs
+          - os: ubuntu-latest
+            fs: plain
+          - os: ubuntu-latest
+            fs: btrfs
             cow: true
-          - fs: xfs
+          - os: ubuntu-latest
+            fs: xfs
             cow: true
           # ZFS gets no `cow: true`: OpenZFS has no fiemap implementation, so
           # tests/reflink.rs cannot prove a shared block there, and FICLONE on a
           # block from the current txg silently content-copies. The leg still
           # covers the fallthrough and the cross-device move. Upgrade path:
           # verify sharing without FIEMAP, then mark it `cow: true`.
-          - fs: zfs
-          - fs: ext4
+          - os: ubuntu-latest
+            fs: zfs
+          - os: ubuntu-latest
+            fs: ext4
+          - os: macos-latest
+            fs: plain
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2

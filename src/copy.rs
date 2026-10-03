@@ -2,7 +2,9 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use rustix::fd::{AsFd, OwnedFd};
-use rustix::fs::{Mode, Stat, copy_file_range, fchmod, fsync};
+#[cfg(target_os = "linux")]
+use rustix::fs::copy_file_range;
+use rustix::fs::{Mode, Stat, fchmod, fsync};
 use rustix::io::{Errno, Result};
 use rustix::ioctl::{IntegerSetter, Setter, ioctl, opcode};
 
@@ -12,12 +14,14 @@ const FICLONE: u32 = opcode::write::<i32>(0x94, 9);
 const CHUNK: usize = 1 << 20;
 /// `copy_file_range` allocates no buffer, so this is only an upper bound on how
 /// much one call may move; the kernel stops at EOF.
+#[cfg(target_os = "linux")]
 const CFR_MAX: u64 = 64 << 20;
 
 /// The `(source device, destination device)` pair a rung has refused, 0 while
 /// undecided. Asking the whole ladder costs three syscalls per file and none of
 /// them move a byte; 0 is not a device number, so it never matches a real pair.
 static NO_REF_LINK: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
 static NO_CFR: AtomicU64 = AtomicU64::new(0);
 
 /// Both devices go into the key, not just the destination: `FICLONE` answers
@@ -45,20 +49,27 @@ pub fn clone_file(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method>
 
     // `copy_file_range` is one syscall per 1 MiB instead of per 4 KiB, and on
     // kernels that support it across mounts stays entirely in the kernel.
-    let mut remaining = src_st.st_size.max(0) as u64;
-    while remaining > 0 && NO_CFR.load(Relaxed) != key {
-        match copy_file_range(src, None, dst, None, remaining.min(CFR_MAX) as usize) {
-            Ok(0) => break,
-            Ok(n) => remaining -= n as u64,
-            Err(e) if unavailable(e) => {
-                NO_CFR.store(key, Relaxed);
-                break;
+    //
+    // rustix only ships it on Linux and `std::fs::copy_file_range` is still
+    // unstable, so elsewhere the rung is skipped and `copy_stream` pays. macOS
+    // has its own `clonefile`; add it as a rung before anyone needs the speed.
+    #[cfg(target_os = "linux")]
+    {
+        let mut remaining = src_st.st_size.max(0) as u64;
+        while remaining > 0 && NO_CFR.load(Relaxed) != key {
+            match copy_file_range(src, None, dst, None, remaining.min(CFR_MAX) as usize) {
+                Ok(0) => break,
+                Ok(n) => remaining -= n as u64,
+                Err(e) if unavailable(e) => {
+                    NO_CFR.store(key, Relaxed);
+                    break;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         }
-    }
-    if remaining == 0 {
-        return Ok(Method::CopyFileRange);
+        if remaining == 0 {
+            return Ok(Method::CopyFileRange);
+        }
     }
 
     copy_stream(src, dst)?;
