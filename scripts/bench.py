@@ -230,6 +230,9 @@ def cut_bench(name, dr, dc):
 def main():
     global REPS
     REPS = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    # Piped to tee, print() block-buffers while subprocess writes straight to
+    # fd 1, so unbuffered puts df output back under the banner that asked for it.
+    sys.stdout.reconfigure(line_buffering=True)
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(BTRFS_WORK, exist_ok=True)
     for impl in IMPLS:
