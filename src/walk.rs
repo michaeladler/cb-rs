@@ -6,10 +6,32 @@ use std::sync::Mutex;
 use crossbeam_deque::{Injector, Steal, Worker};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, CWD, Dir, FileType, Mode, OFlags, chmodat, mkdirat, mknodat, openat, readlinkat,
-    statat, symlinkat, unlinkat,
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, chmodat, mkdirat, openat, readlinkat, statat,
+    symlinkat, unlinkat,
 };
 use rustix::io::{Errno, Result as IoResult};
+
+#[cfg(not(target_vendor = "apple"))]
+use rustix::fs::mknodat;
+
+/// macOS has no `mknodat` — it was never taken up by the BSDs — and rustix
+/// ships no path-based `mknod` to fall back on, so a fifo or device node
+/// cannot be recreated from an open directory fd. Report it like any other
+/// failure rather than dropping the entry silently.
+///
+/// ponytail: macOS copies of trees with special files lose those entries.
+/// Upgrade path: `mkfifoat` where the kernel has it, `clonefile`/`fcopyfile`
+/// for the reflink rung, and a libc `mknod` on the full path for the rest.
+#[cfg(target_vendor = "apple")]
+fn mknodat<P: rustix::path::Arg, Fd: rustix::fd::AsFd>(
+    _dirfd: Fd,
+    _path: P,
+    _file_type: FileType,
+    _mode: Mode,
+    _dev: rustix::fs::Dev,
+) -> IoResult<()> {
+    Err(Errno::PERM)
+}
 
 use crate::copy;
 

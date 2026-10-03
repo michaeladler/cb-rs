@@ -14,6 +14,10 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{Mode, OFlags, fstat, open};
 use rustix::ioctl::{Opcode, Updater, opcode};
 
+/// Linux only: `opcode::write` encodes the direction bits the BSD way on other
+/// targets, so the value is not the kernel constant there and the rung is not
+/// compiled in either.
+#[cfg(target_os = "linux")]
 const FICLONE: Opcode = opcode::write::<i32>(0x94, 9);
 /// `_IOWR('f', 11, struct fiemap)`: the size in the opcode is the 32-byte
 /// header, not the whole buffer we pass.
@@ -388,6 +392,7 @@ fn a_refused_reflink_does_not_leak_to_another_device() {
 
 /// Guards the opcode the rung depends on. A wrong value here compiles, runs,
 /// and silently reports `EOPNOTSUPP` on every filesystem.
+#[cfg(target_os = "linux")]
 #[test]
 fn ficlone_opcode_matches_the_kernel_constant() {
     assert_eq!(FICLONE, 0x4004_9409, "_IOW(0x94, 9, int)");
