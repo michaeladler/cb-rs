@@ -75,39 +75,7 @@ jobs:
           export site
           mkdir -p "$site"
           cp bench.log "$site/"
-          python3 - <<'PY'
-          import datetime, html, os, platform, re
-
-          log = open("bench.log", errors="replace").read()
-          log = re.sub(r"\x1b\[[0-9;]*m", "", log)  # banner() writes bold escapes
-          sha = os.environ["GITHUB_SHA"]
-          open(os.path.join(os.environ["site"], "index.html"), "w").write("""<!doctype html>
-          <meta charset="utf-8">
-          <title>cb-rs benchmarks</title>
-          <style>
-          body {{ font: 14px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }}
-          pre {{ font: 13px/1.45 ui-monospace, monospace; overflow-x: auto; }}
-          dt {{ font-weight: 600; }}
-          </style>
-          <h1>cb-rs benchmarks</h1>
-          <p>scripts/bench.py, {reps} reps per row, against <code>cb</code> 0.10.0.</p>
-          <dl>
-            <dt>run</dt><dd>{date}</dd>
-            <dt>commit</dt><dd><a href="{repo}/commit/{sha}">{sha}</a></dd>
-            <dt>runner</dt><dd>{runner}</dd>
-          </dl>
-          <p>See the <a href="{repo}#benchmarks">README</a> for what each shape
-          measures and how to run this yourself.</p>
-          <pre>{log}</pre>
-          """.format(
-              reps=os.environ.get("REPS", "5"),
-              date=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-              sha=sha[:12],
-              repo=os.environ["GITHUB_REPOSITORY"].join(("https://github.com/", "")),
-              runner=html.escape("%s, %s cores" % (platform.platform(), os.cpu_count())),
-              log=html.escape(log),
-          ))
-          PY
+          scripts/benchhtml.py bench.log "$site/index.html"
           cd "$site"
           git init -q -b gh-pages
           git config user.name github-actions[bot]

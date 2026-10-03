@@ -73,6 +73,15 @@ jobs:
             exit 1
           fi
 
+  # The bench page is generated from bench.log by a parser, not hand-written
+  # HTML, so it breaks silently when bench.py's row format changes.
+  benchhtml:
+    name: bench page parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+
   format:
     name: cargo fmt
     runs-on: ubuntu-latest
