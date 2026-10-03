@@ -1,5 +1,6 @@
-import os, re, sys, unittest
+import contextlib, io, os, re, sys, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+import bench
 import benchhtml
 
 LOG = """Filesystem      Size  Used Avail Use% Mounted on
@@ -77,6 +78,37 @@ class Test(unittest.TestCase):
         self.assertIn("<h3>cut+paste small -&gt; /home/runner/bench/cut_r</h3>", out)
         # one column header per h2, not one per cut+paste sub-block
         self.assertEqual(out.count("<thead>"), 2)
+
+    def test_ratio(self):
+        p = benchhtml.Pair("copy", "small", {"cb-rs": (318, 318), "cb": (479, 479)}, {})
+        self.assertEqual(benchhtml.ratio(p), "1.5&times;")
+        # 0 ms is a median under the clock's resolution, not a missing row: it
+        # gets a bound, and it is the biggest win the bench can print.
+        zero = benchhtml.Pair("paste", "small", {"cb-rs": (0, 0), "cb": (700, 700)}, {})
+        self.assertEqual(benchhtml.ratio(zero), "&gt;700&times;")
+        self.assertEqual(benchhtml.ratio(
+            benchhtml.Pair("cut", "small", {"cb-rs": (0, 0), "cb": (0, 0)}, {})), "&mdash;")
+        self.assertEqual(benchhtml.ratio(
+            benchhtml.Pair("cut", "small", {"cb-rs": (1, 1)}, {})), "&mdash;")
+
+    def test_bench_py_format(self):
+        """bench.py writes the rows, so its format string is the contract. LOG is
+        hand-copied and cannot see bench.py change under it."""
+        for args in (("copy", "small", "cb-rs", 318, 318, 0, "20000 files"),
+                     ("paste", "4k x4000", "cb", 733, 733, 1, ""),  # rc != 0
+                     ("cut", "big", "cb-rs", 0, 0, 0, "")):
+            with contextlib.redirect_stdout(io.StringIO()) as f:
+                bench.row(*args)
+            self.assertIsNotNone(benchhtml.row(f.getvalue()), f.getvalue())
+
+        # The retention block does not go through row(): it prints its own line,
+        # with the unit on the minimum too.
+        with contextlib.redirect_stdout(io.StringIO()) as f:
+            print("copy x5 %-6s %4d ms   min %4d ms   clipboard now holds"
+                  " cb-rs %-6s cb %-6s" % ("cb", 1069, 1069, "0", "513M"))
+        self.assertEqual(benchhtml.row(f.getvalue()),
+                         ("copy", "x5", "cb", 1069, 1069,
+                          "clipboard now holds cb-rs 0 cb 513M"))
 
     def test_escapes(self):
         out = benchhtml.render("== a\ncopy x cb-rs 1 ms min 1 &<>\"'\n")

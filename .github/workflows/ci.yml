@@ -85,14 +85,19 @@ jobs:
             exit 1
           fi
 
-  # The bench page is generated from bench.log by a parser, not hand-written
-  # HTML, so it breaks silently when bench.py's row format changes.
+  # The bench page is parsed out of bench.log, not hand-written, so bench.py's
+  # row format and the parser can drift apart and only the published page shows
+  # it. tests/test_benchhtml.py builds its rows with bench.row(), so the format
+  # is checked at both ends rather than hand-copied once.
   benchhtml:
-    name: bench page parser
+    name: bench page generator
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      # python3 is the runner image's own; the bench scripts are stdlib-only, so
+      # there is nothing to install and no version to pin.
+      - name: benchhtml unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
   format:
     name: cargo fmt
