@@ -20,7 +20,7 @@ jobs:
 
       # goreleaser's rust builder is cargo zigbuild, and it installs neither
       # zig nor cargo-zigbuild itself.
-      - uses: xyzzylabs/setup-zig@v1
+      - uses: xyzzylabs/setup-zig@ab632f9cc6f98d89d3b8f2c2e1577a929d0e70f3 # v1.0.4
 
       - name: install cargo-zigbuild
         env:
@@ -34,7 +34,7 @@ jobs:
           echo "$(awk '{print $1}' "$a.sha256")  $a" | sha256sum -c -
           tar -C "$HOME/.cargo/bin" --strip-components=1 -xf "$a"
 
-      - uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: '~> v2'
