@@ -22,10 +22,22 @@ cargo test                 # tests/reflink.rs skips itself without a CoW volume
 ```
 
 The reflink tests need a CoW directory: btrfs, or XFS formatted with
-`mkfs.xfs -m reflink=1`. They default to `./mount`, or `CB_BTRFS_DIR` when the
-volume lives elsewhere, and skip when the filesystem cannot reflink.
-`scripts/btrfs-testvol.sh` creates and mounts the loopback btrfs image at `./mount`
-for them and for the cross-filesystem benchmark below.
+`mkfs.xfs -m reflink=1`. They default to `./mount-btrfs`, or `CB_TESTVOL_DIR` when
+the volume lives elsewhere, and skip when the filesystem cannot reflink.
+
+`scripts/testvol.sh <btrfs|xfs|ext4|zfs> [mountpoint]` creates and mounts a sparse
+loopback image of that type on `./mount-<fs>`, chowns the mount root to you
+(mkfs leaves it owned by root, which would make every test probe fail and skip
+instead of run), and fails loudly if the result is not writable. Point
+`CB_TESTVOL_DIR` at the mount and `cargo test` runs against it; with no volume
+and no env var the reflink and cross-device tests skip.
+
+CI runs the whole suite five times: with no volume at all, and once each on a
+btrfs, XFS (`reflink=1`), ZFS and ext4 volume. The btrfs and XFS legs fail if any
+reflink test skipped, since a CoW volume that quietly skips is worse than no
+volume. The ZFS leg gets no such check: OpenZFS implements no fiemap, so
+tests/reflink.rs cannot prove a shared block there, and FICLONE on a block from
+the current txg silently copies instead of cloning.
 
 ## Where the clipboard lives
 
@@ -59,7 +71,7 @@ means the same filesystem for both binaries, and it exercises three shapes:
 | shape    | source | clipboard | destination       |
 |----------|--------|-----------|-------------------|
 | local    | tmpfs  | tmpfs     | tmpfs             |
-| cross-fs | tmpfs  | tmpfs     | btrfs (`./mount`) |
+| cross-fs | tmpfs  | tmpfs     | btrfs (`./mount-btrfs`) |
 | reflink  | btrfs  | btrfs     | btrfs             |
 
 Every row is the median of five runs; the minimum is next to it. All file counts
@@ -84,7 +96,7 @@ ladder can answer it out of a hole).
 
 ### Cross-filesystem: tmpfs → btrfs
 
-`./mount` is a plain btrfs loop volume, no compression, so the cross-filesystem
+`./mount-btrfs` is a plain btrfs loop volume, no compression, so the cross-filesystem
 rows measure the copy path and nothing else.
 
 | op          | workload         | cb-rs              | cb               |

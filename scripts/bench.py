@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare cb-rs against cb 0.10.0 on copy / cut / paste.
 
-Two filesystems are in play: WORK is tmpfs (RAM), ./mount is the btrfs loop
+Two filesystems are in play: WORK is tmpfs (RAM), ./mount-btrfs is the btrfs loop
 volume. Each clipboard staging directory is placed next to the data it moves,
 so "same fs" means same fs for both binaries.
 
@@ -23,7 +23,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(os.environ["HOME"], "bench")
-BTRFS_WORK = os.path.join(ROOT, "mount/bench")
+BTRFS_WORK = os.path.join(ROOT, "mount-btrfs/bench")
 BIG = 512 << 20
 SMALL_LOCAL = 20000
 SMALL_CROSS = 4000
@@ -295,7 +295,7 @@ def main():
     rm_rf(ret)
 
     banner("space")
-    subprocess.run(["df", "-h", WORK, os.path.join(ROOT, "mount")])
+    subprocess.run(["df", "-h", WORK, os.path.join(ROOT, "mount-btrfs")])
 
 
 if __name__ == "__main__":

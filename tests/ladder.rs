@@ -187,6 +187,51 @@ fn move_uses_rename_and_leaves_no_source() {
     assert!(!src.exists(), "source must be gone after a successful move");
 }
 
+/// A writable directory on a filesystem other than the temp dir's, or `None`.
+/// `renameat2` answers `EXDEV` for two mounts, and only `EXDEV` takes the mover
+/// down its copy-then-delete branch, so this cannot be faked with a second
+/// directory on the same filesystem. `scripts/testvol.sh` provides one.
+fn other_device_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("CB_TESTVOL_DIR")?)
+        .join(format!("cb-xdev-{}", std::process::id()));
+    fs::create_dir_all(&dir).ok()?;
+    let temp_dev = fs::metadata(std::env::temp_dir()).ok()?.dev();
+    (fs::metadata(&dir).ok()?.dev() != temp_dev).then_some(dir)
+}
+
+/// The cross-filesystem move: copy the whole tree, get it on disk, and only then
+/// unlink the original. A tree rather than a file so the walk, the directory
+/// `fsync` and the recursive delete all take the cross-device path too.
+#[test]
+fn a_move_across_devices_copies_verifies_then_deletes() {
+    let Some(xdev) = other_device_dir() else {
+        eprintln!("skipping: no second filesystem (set CB_TESTVOL_DIR)");
+        return;
+    };
+    let sandbox = Sandbox::new("xdev-move");
+    let src = sandbox.path("tree");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("sub/inner.txt"), b"inner").unwrap();
+    fs::write(src.join("top.txt"), b"top").unwrap();
+    let dst_dir = xdev.join("dst");
+    fs::create_dir_all(&dst_dir).unwrap();
+
+    let outcome = move_into(&src, &dst_dir, Policy::Skip).unwrap();
+
+    assert!(matches!(outcome, Outcome::Moved));
+    assert_eq!(
+        fs::read(dst_dir.join("tree/sub/inner.txt")).unwrap(),
+        b"inner"
+    );
+    assert_eq!(fs::read(dst_dir.join("tree/top.txt")).unwrap(), b"top");
+    assert!(
+        !src.exists(),
+        "the source is unlinked only after the copy is verified, so a completed \
+         move must leave nothing behind"
+    );
+    let _ = fs::remove_dir_all(&xdev);
+}
+
 #[test]
 fn move_skips_an_existing_destination_by_default() {
     let sandbox = Sandbox::new("move-skip");

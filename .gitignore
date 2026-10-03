@@ -11,7 +11,7 @@ devenv.local.yaml
 
 # CoW test volume for tests/reflink.rs
 *.img
-mount/
+mount*/
 
 target
 __pycache__

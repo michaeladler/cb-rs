@@ -1,6 +1,7 @@
 //! The reflink rung needs a CoW filesystem to be observable at all. Set
-//! `CB_BTRFS_DIR` to a btrfs (or XFS with `reflink=1`) directory; the tests skip
-//! without one so the rest of the suite still runs on a plain filesystem.
+//! `CB_TESTVOL_DIR` to a mounted btrfs (or XFS with `reflink=1`) directory; the
+//! tests skip without one so the rest of the suite still runs on a plain
+//! filesystem.
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -43,9 +44,9 @@ struct FiemapExtent {
 }
 
 /// Physical offset of the first extent, the thing a reflink shares and a byte
-/// copy never can.
-fn first_extent_physical(path: &Path) -> u64 {
-    let file = open(path, OFlags::RDONLY, Mode::empty()).unwrap();
+/// copy never can, or `None` when the filesystem cannot answer FIEMAP.
+fn try_first_extent_physical(path: &Path) -> Option<u64> {
+    let file = open(path, OFlags::RDONLY, Mode::empty()).ok()?;
     let mut map = Fiemap {
         fm_length: u64::MAX,
         fm_extent_count: MAX_EXTENTS as u32,
@@ -54,26 +55,34 @@ fn first_extent_physical(path: &Path) -> u64 {
     // SAFETY: the opcode is FS_IOC_FIEMAP and `map` is a correctly laid out
     // `struct fiemap` with room for the extents the kernel is told about.
     let result = unsafe { rustix::ioctl::ioctl(&file, Updater::<FIEMAP, _>::new(&mut map)) };
-    assert!(matches!(result, Ok(())), "FIEMAP failed on {path:?}");
-    assert!(map.fm_mapped_extents > 0, "no extents mapped for {path:?}");
-    map.fm_extents[0].fe_physical
+    if result.is_err() || map.fm_mapped_extents == 0 {
+        return None;
+    }
+    Some(map.fm_extents[0].fe_physical)
+}
+
+fn first_extent_physical(path: &Path) -> u64 {
+    try_first_extent_physical(path).unwrap_or_else(|| panic!("FIEMAP failed on {path:?}"))
 }
 
 fn shared_with_source(src: &Path, dst: &Path) -> bool {
     first_extent_physical(src) == first_extent_physical(dst)
 }
 
-/// The CoW test volume, or `None` when this machine has none. The `CB_BTRFS_DIR`
-/// override exists because the loop-mounted image lives outside any fixed path.
+/// The CoW test volume, or `None` when this machine has none. It defaults to the
+/// btrfs volume `scripts/testvol.sh` mounts; `CB_TESTVOL_DIR` points the tests
+/// at any other one.
 ///
 /// The probe asks the ladder whether it can reflink instead of checking
 /// `f_type`: XFS only does FICLONE when formatted `mkfs.xfs -m reflink=1`, and a
 /// magic-number allowlist would pass that volume here and then fail every
-/// `Method::Reflink` assert instead of skipping.
+/// `Method::Reflink` assert instead of skipping. It also requires the clone's
+/// extents to be readable by FIEMAP and shared, which is the property these
+/// tests assert; a filesystem that reflinks without FIEMAP (OpenZFS) skips.
 fn cow_dir() -> Option<PathBuf> {
-    let dir = match std::env::var_os("CB_BTRFS_DIR") {
+    let dir = match std::env::var_os("CB_TESTVOL_DIR") {
         Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mount"),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mount-btrfs"),
     };
     // Per-call names: the tests run in parallel and a shared probe path would be
     // truncated out from under a neighbour mid-clone.
@@ -92,9 +101,16 @@ fn cow_dir() -> Option<PathBuf> {
     let verdict = clone_file(&src_fd, &dst_fd, &src_st).ok();
     drop(src_fd);
     drop(dst_fd);
+    // Reflink alone is not enough: OpenZFS answers FICLONE with Method::Reflink
+    // but has no FIEMAP, so the extents cannot be shown to be shared and the
+    // probes would panic. Require a readable physical extent that actually
+    // matches before calling this a CoW volume.
+    let shared = try_first_extent_physical(&probe)
+        .zip(try_first_extent_physical(&clone))
+        .is_some_and(|(src, dst)| src == dst);
     let _ = fs::remove_file(&probe);
     let _ = fs::remove_file(&clone);
-    (verdict == Some(Method::Reflink)).then_some(dir)
+    (verdict == Some(Method::Reflink) && shared).then_some(dir)
 }
 
 struct Case {
@@ -143,7 +159,7 @@ macro_rules! cow_case {
     ($name:ident, $case:ident) => {
         let Some($case) = Case::new(stringify!($name)) else {
             eprintln!(
-                "skipping {}: no CoW volume (set CB_BTRFS_DIR)",
+                "skipping {}: no CoW volume (set CB_TESTVOL_DIR)",
                 stringify!($name)
             );
             return;
@@ -164,7 +180,7 @@ fn reflink_rung_fires_on_a_cow_filesystem() {
     assert_eq!(
         method,
         Method::Reflink,
-        "FICLONE must win on a btrfs volume, not fall through to a byte copy"
+        "FICLONE must win on a CoW volume, not fall through to a byte copy"
     );
     assert_eq!(fs::read(&dst).unwrap(), data);
     assert!(
@@ -254,12 +270,62 @@ fn a_filesystem_without_reflinks_falls_through_to_a_correct_copy() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `FICLONE` across two mounts answers `EXDEV`, not `EOPNOTSUPP`, and the
+/// destination filesystem is CoW either way. So the pair has to be remembered as
+/// refusing the rung while a same-volume clone still reflinks, which is the
+/// device-pair key of `copy.rs` stated from the other side.
+#[test]
+fn a_reflink_refused_across_devices_does_not_leak_to_the_same_device() {
+    let Some(case) = Case::new("xdev") else {
+        eprintln!("skipping: no CoW volume (set CB_TESTVOL_DIR)");
+        return;
+    };
+    let plain = std::env::temp_dir().join(format!("cb-xdev-{}", std::process::id()));
+    fs::create_dir_all(&plain).unwrap();
+    // Two directories on one filesystem would not exercise EXDEV at all.
+    if fs::metadata(&plain).unwrap().dev() == fs::metadata(&case.dir).unwrap().dev() {
+        eprintln!("skipping: the temp dir is on the same device as the test volume");
+        let _ = fs::remove_dir_all(&plain);
+        return;
+    }
+
+    let data = vec![0x44u8; 128 * 1024];
+    let src = plain.join("src.bin");
+    fs::write(&src, &data).unwrap();
+    let cross = {
+        let src_fd = open(&src, OFlags::RDONLY, Mode::empty()).unwrap();
+        let src_st = fstat(&src_fd).unwrap();
+        let dst_fd = open(
+            case.path("cross.bin"),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .unwrap();
+        clone_file(&src_fd, &dst_fd, &src_st).unwrap()
+    };
+
+    assert_ne!(
+        cross,
+        Method::Reflink,
+        "FICLONE cannot span two mounts, so this is not a reflink"
+    );
+    assert_eq!(fs::read(case.path("cross.bin")).unwrap(), data);
+
+    let same = case.write("same.bin", &data);
+    assert_eq!(
+        case.clone(&same, "same-copy.bin"),
+        Method::Reflink,
+        "a rung refused for one device pair must still be tried for another"
+    );
+    let _ = fs::remove_dir_all(&plain);
+}
+
 /// The rung as the walker reaches it, not just as the helper: a reflink that
 /// only works when called directly is not wired up.
 #[test]
 fn the_walker_copy_also_reflinks() {
     let Some(case) = Case::new("walker") else {
-        eprintln!("skipping: no CoW volume (set CB_BTRFS_DIR)");
+        eprintln!("skipping: no CoW volume (set CB_TESTVOL_DIR)");
         return;
     };
     let data = vec![0x77u8; 256 * 1024];
@@ -290,7 +356,7 @@ fn a_refused_reflink_does_not_leak_to_another_device() {
         let src_fd = open(&src, OFlags::RDONLY, Mode::empty()).unwrap();
         let src_st = fstat(&src_fd).unwrap();
         let dst_fd = open(
-            &plain.join("first.bin"),
+            plain.join("first.bin"),
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             Mode::RUSR | Mode::WUSR,
         )
@@ -305,7 +371,7 @@ fn a_refused_reflink_does_not_leak_to_another_device() {
     assert_eq!(fs::read(plain.join("first.bin")).unwrap(), data);
 
     let Some(case) = Case::new("devkey") else {
-        eprintln!("skipping: no CoW volume (set CB_BTRFS_DIR)");
+        eprintln!("skipping: no CoW volume (set CB_TESTVOL_DIR)");
         let _ = fs::remove_dir_all(&plain);
         return;
     };

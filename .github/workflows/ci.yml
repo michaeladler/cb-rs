@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # One leg per filesystem the copy ladder claims to handle. `plain` is the
+  # suite with no volume at all, where the reflink tests must skip; btrfs and
+  # XFS are the two CoW filesystems with different kernel FICLONE paths; ext4
+  # is a real block filesystem with no reflink, so it exercises the fallthrough
+  # and the cross-device move.
+  test:
+    name: cargo test (${{ matrix.fs }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fs: plain
+          - fs: btrfs
+            cow: true
+          - fs: xfs
+            cow: true
+          # ZFS gets no `cow: true`: OpenZFS has no fiemap implementation, so
+          # tests/reflink.rs cannot prove a shared block there, and FICLONE on a
+          # block from the current txg silently content-copies. The leg still
+          # covers the fallthrough and the cross-device move. Upgrade path:
+          # verify sharing without FIEMAP, then mark it `cow: true`.
+          - fs: zfs
+          - fs: ext4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+
+      - name: install filesystem tools
+        if: matrix.fs != 'plain'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs xfsprogs e2fsprogs
+
+      # zpool needs the kernel module, and the hosted kernel ships it unloaded.
+      - name: Install ZFS Utilities
+        if: matrix.fs == 'zfs'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zfsutils-linux
+          sudo modprobe zfs
+
+      - name: mount the ${{ matrix.fs }} test volume
+        if: matrix.fs != 'plain'
+        run: scripts/testvol.sh ${{ matrix.fs }} "$RUNNER_TEMP/volume"
+
+      - name: cargo test
+        env:
+          CB_TESTVOL_DIR: ${{ runner.temp }}/volume
+        run: |
+          set -o pipefail
+          cargo test --all-features -- --nocapture 2>&1 | tee ci-test.log
+
+      # A skipped reflink test is a green check that tested nothing, which is
+      # exactly what an unwritable or reflink-less volume looks like.
+      - name: the reflink tests must run on ${{ matrix.fs }}
+        if: matrix.cow
+        run: |
+          # Skip messages start the line; `test ..._silently_skipping ... ok` does not.
+          if grep -qE '^skipping' ci-test.log; then
+            echo "::error::reflink tests skipped on a ${{ matrix.fs }} volume"
+            grep -E '^skipping' ci-test.log
+            exit 1
+          fi
+
+  format:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          components: rustfmt
+      - name: Rustfmt Check
+        uses: actions-rust-lang/rustfmt@4066006ec54a31931b9b1fddfd38f2fdf2d27143 # v1.1.2
+
+  lint:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          components: clippy
+      # --all-targets covers tests and benches; -D warnings makes clippy findings
+      # fail the job instead of scrolling past.
+      - run: cargo clippy --all-features --all-targets -- -D warnings
