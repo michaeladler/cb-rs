@@ -8,7 +8,13 @@ builds:
     command: build
     binary: cb
     targets:
-      - x86_64-unknown-linux-gnu
+      # musl, not gnu: zig cc can't link glibc statically, and musl gives a
+      # fully static binary that runs on any distro, incl. Alpine/scratch.
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      # Cross-built from Linux by cargo-zigbuild.
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
 
 archives:
   - id: cb
