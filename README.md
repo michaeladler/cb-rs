@@ -71,6 +71,20 @@ path fsyncs the destination before unlinking the source, so it's also generally 
 cargo build --release
 ```
 
+## Man page and shell completions
+
+Both are generated from the CLI, so they cannot drift:
+
+```sh
+cb man > cb.1
+cb completions bash > /etc/bash_completion.d/cb
+cb completions zsh  > ~/.local/share/zsh/site-functions/_cb
+cb completions fish > ~/.config/fish/completions/cb.fish
+```
+
+`elvish` and `powershell` work the same way. `cb completions --help` explains the
+command itself, which is fine inside a completion script.
+
 ## Test
 
 ```sh

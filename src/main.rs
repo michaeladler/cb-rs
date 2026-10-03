@@ -1,7 +1,9 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 use cb_rs::mover;
 use cb_rs::paths::{self, Clipboard};
@@ -44,10 +46,38 @@ enum Command {
     },
     /// List what the clipboard holds.
     List,
+    /// Print a shell completion script to stdout.
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+    /// Print the roff man page to stdout.
+    Man,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Generation-only commands: no clipboard, no IO.
+    match &cli.command {
+        Command::Completions { shell } => {
+            // Buffer it: clap_complete panics on a broken pipe, so `cb
+            // completions bash | head` would abort instead of exiting 0.
+            let mut script = Vec::new();
+            clap_complete::generate(*shell, &mut Cli::command(), "cb", &mut script);
+            let _ = std::io::stdout().write_all(&script);
+            return ExitCode::SUCCESS;
+        }
+        Command::Man => {
+            // Package is cb-rs, the command users type is cb.
+            let cmd = Cli::command().name("cb");
+            // Same broken-pipe handling as completions.
+            let _ = clap_mangen::Man::new(cmd).render(&mut std::io::stdout());
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+
     let clipboard = Clipboard::open(cli.name.as_deref().unwrap_or(paths::DEFAULT_NAME));
 
     let result = match cli.command {
@@ -62,6 +92,7 @@ fn main() -> ExitCode {
             on_conflict,
         ),
         Command::List => do_list(&clipboard),
+        Command::Completions { .. } | Command::Man => unreachable!(),
     };
 
     match result {
