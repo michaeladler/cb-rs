@@ -28,12 +28,18 @@ fn man_page_documents_the_commands() {
     for expected in [
         ".TH cb 1",
         "Cut, copy, and paste files",
-        "COMMANDS",
-        "cb\\-paste(1)",
+        ".SH COMMANDS",
+        ".SS cb paste",
+        "on\\-conflict",
     ] {
         assert!(
             man.contains(expected),
             "man page missing {expected:?}:\n{man}"
         );
     }
+    // Subcommand pages are inlined, never referenced: cb-copy(1) is not shipped.
+    assert!(
+        !man.contains("(1)"),
+        "man page references a page it does not generate:\n{man}"
+    );
 }

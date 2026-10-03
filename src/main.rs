@@ -26,12 +26,14 @@ struct Cli {
 enum Command {
     /// Copy files into the clipboard, leaving the originals in place.
     Copy {
+        /// Files or directories to copy.
         #[arg(required = true, action = ArgAction::Append)]
         paths: Vec<PathBuf>,
     },
     /// Record files to be moved when pasted. The originals stay in place until
     /// then.
     Cut {
+        /// Files or directories to move on paste.
         #[arg(required = true, action = ArgAction::Append)]
         paths: Vec<PathBuf>,
     },
@@ -69,10 +71,8 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Command::Man => {
-            // Package is cb-rs, the command users type is cb.
-            let cmd = Cli::command().name("cb");
             // Same broken-pipe handling as completions.
-            let _ = clap_mangen::Man::new(cmd).render(&mut std::io::stdout());
+            let _ = std::io::stdout().write_all(man_page().as_bytes());
             return ExitCode::SUCCESS;
         }
         _ => {}
@@ -102,6 +102,59 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// One self-contained page. clap_mangen's subcommand list cross-references
+/// `cb-copy(1)`, `cb-paste(1)` & co, pages nobody generates, so drop it and
+/// inline each subcommand's description and options instead.
+fn man_page() -> String {
+    // Package is cb-rs, the command users type is cb.
+    let mut cmd = Cli::command().name("cb");
+    cmd.build();
+    let mut page = section(&render_man(&cmd), "SUBCOMMANDS", false);
+
+    let mut commands = String::from(".SH COMMANDS\n");
+    for sub in cmd.get_subcommands() {
+        let sub_page = render_man(sub);
+        commands.push_str(&format!(
+            ".SS cb {}\n{}\n{}\n",
+            sub.get_name(),
+            section(&sub_page, "DESCRIPTION", true),
+            section(&sub_page, "OPTIONS", true)
+        ));
+    }
+    // VERSION renders before SUBCOMMANDS; keep it last.
+    match page.split_once(".SH VERSION\n") {
+        Some((head, tail)) => page = format!("{head}\n{commands}.SH VERSION\n{tail}"),
+        None => page.push_str(&commands),
+    }
+    page
+}
+
+fn render_man(cmd: &clap::Command) -> String {
+    let mut roff = Vec::new();
+    let _ = clap_mangen::Man::new(cmd.clone()).render(&mut roff);
+    String::from_utf8_lossy(&roff).into_owned()
+}
+
+/// Keep, or drop, the body of one `.SH` section of generated roff. Its heading
+/// always goes: the caller supplies its own, or it belongs to another section.
+fn section(roff: &str, name: &str, keep: bool) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in roff.lines() {
+        if let Some(heading) = line.strip_prefix(".SH ") {
+            inside = heading == name;
+            if !inside && !keep {
+                out.push_str(line);
+                out.push('\n');
+            }
+        } else if inside == keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn do_copy(clipboard: &Clipboard, items: &[PathBuf]) -> Result<(), String> {
