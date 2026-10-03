@@ -1,4 +1,5 @@
 [![ci](https://github.com/michaeladler/cb-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/michaeladler/cb-rs/actions/workflows/ci.yml)
+[![bench](https://github.com/michaeladler/cb-rs/actions/workflows/bench.yml/badge.svg)](https://github.com/michaeladler/cb-rs/actions/workflows/bench.yml)
 
 # cb-rs
 
@@ -85,7 +86,13 @@ other's clipboard data, even though they share the same root and
 
 `scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 on copy, cut, and
 paste. It stages each clipboard next to the data it moves, so "same filesystem"
-means the same filesystem for both binaries, and it exercises three shapes:
+means the same filesystem for both binaries, and it exercises three shapes.
+
+The tables below are a snapshot from one machine. The `bench` workflow runs the
+same script on a GitHub runner weekly, and on demand from the Actions tab, and
+publishes the raw output at <https://michaeladler.github.io/cb-rs/>. A runner is
+not the machine below, so read that page for the ratios and these tables for the
+reasoning.
 
 | shape    | source | clipboard | destination       |
 |----------|--------|-----------|-------------------|

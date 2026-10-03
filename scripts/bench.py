@@ -9,6 +9,9 @@ so "same fs" means same fs for both binaries.
     crossfs : tmpfs source -> tmpfs clipboard -> btrfs destination
     reflink : btrfs source -> btrfs clipboard -> btrfs destination
 
+Needs $HOME/bench to be a tmpfs and ./mount-btrfs mounted (scripts/testvol.sh
+btrfs). The bench workflow does both and publishes the output on gh-pages.
+
 Usage: scripts/bench.py [reps]
 """
 
