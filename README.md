@@ -1,43 +1,56 @@
+[![ci](https://github.com/michaeladler/cb-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/michaeladler/cb-rs/actions/workflows/ci.yml)
+
 # cb-rs
 
-A Rust rewrite of [Clipboard](https://github.com/Slackadays/Clipboard) (`cb`), the
-cut/copy/paste tool for the command line. Same commands, same on-disk clipboard
-layout, so you can switch between the two binaries without losing your clipboard.
+A faster, safer Rust rewrite of the file copy/cut/paste core of
+[Clipboard](https://github.com/Slackadays/Clipboard) (`cb`), the cut/copy/paste
+tool for the command line. It uses the same `$XDG_STATE_HOME/clipboard/<name>`
+location and the same `metadata/originals` cut-tracking file, but stores copied
+files one level shallower (no per-entry subdirectory) and implements only the
+file-based commands. A drop-in for the copy/cut/paste workflow, not for `cb`'s
+text clipboard, history, or its other commands.
+
+## Example
 
 ```sh
-cb-rs copy notes.txt ~/images     # copy, originals stay
-cb-rs cut old-build/              # record for moving
-cb-rs paste -d /tmp/out           # write into /tmp/out
-cb-rs list
+cb copy notes.txt ~/images     # copy, originals stay
+cb cut old-build/              # record for moving
+cb paste -d /tmp/out           # write into /tmp/out
+cb list
 ```
 
 `--on-conflict skip|replace|ask` decides what happens when the destination already
 exists; the default is `skip`.
 
+## Why a rewrite
+
+Upstream `cb` is practically unmaintained and has known bugs, some of them
+destructive. A headless `cb paste` after a `cb cut` consumes the clipboard and
+deletes the originals without writing anything to the destination; the overwrite
+prompt spins at 100% CPU on EOF. See the caveats below for the full list. It can
+also be slow (20000 small files, cross-filesystem moves, reflink-capable
+filesystems).
+This rewrite is **significantly faster** on those shapes, and its move
+path fsyncs the destination before unlinking the source, so it's also generally **safer**.
+
 ## Build
 
 ```sh
-cargo build --release      # target/release/cb-rs
-cargo test                 # tests/reflink.rs skips itself without a CoW volume
+cargo build --release
 ```
 
-The reflink tests need a CoW directory: btrfs, or XFS formatted with
-`mkfs.xfs -m reflink=1`. They default to `./mount-btrfs`, or `CB_TESTVOL_DIR` when
-the volume lives elsewhere, and skip when the filesystem cannot reflink.
+## Test
+
+```sh
+cargo test
+```
+
+**Note**: The reflink tests need a CoW directory.
 
 `scripts/testvol.sh <btrfs|xfs|ext4|zfs> [mountpoint]` creates and mounts a sparse
-loopback image of that type on `./mount-<fs>`, chowns the mount root to you
-(mkfs leaves it owned by root, which would make every test probe fail and skip
-instead of run), and fails loudly if the result is not writable. Point
-`CB_TESTVOL_DIR` at the mount and `cargo test` runs against it; with no volume
+loopback image of that type on `./mount-<fs>` and chowns the mount root to you.
+Point `CB_TESTVOL_DIR` at the mount and `cargo test` runs against it; with no volume
 and no env var the reflink and cross-device tests skip.
-
-CI runs the whole suite five times: with no volume at all, and once each on a
-btrfs, XFS (`reflink=1`), ZFS and ext4 volume. The btrfs and XFS legs fail if any
-reflink test skipped, since a CoW volume that quietly skips is worse than no
-volume. The ZFS leg gets no such check: OpenZFS implements no fiemap, so
-tests/reflink.rs cannot prove a shared block there, and FICLONE on a block from
-the current txg silently copies instead of cloning.
 
 ## Where the clipboard lives
 
@@ -45,20 +58,26 @@ the current txg silently copies instead of cloning.
 whatever `CLIPBOARD_PERSISTDIR` points at. `<name>/data` holds the files,
 `<name>/metadata/originals` holds the absolute sources recorded by `cut`.
 
+Copied files land directly in `<name>/data/`, one per top-level item. The C++
+`cb` nests them under `<name>/data/<entry>/`, since it keeps a per-clipboard
+history of numbered entries. The two tools therefore do not read each
+other's clipboard data, even though they share the same root and
+`originals` file.
+
 ## How it differs from the C++ implementation
 
 - **`cut` is metadata only.** It records absolute source paths and moves them at
-  paste time. `cb` copies every byte into its clipboard when you cut, so cut plus
+  paste time. The original `cb` copies every byte into its clipboard when you cut, so cut plus
   paste costs two copies; here it costs one, and a same-filesystem paste is a
   single `renameat2`.
 - **Copy climbs a ladder.** Reflink (`FICLONE`) first, then `copy_file_range`, then
-  a 1 MiB buffered stream. `copy.rs` reports which rung paid off.
+  a 1 MiB buffered stream.
 - **Directory walks are work-stealing.** One crossbeam deque per thread over
-  `openat`-relative paths, so thousands of small files are copied in parallel.
+  `openat`-relative paths, so thousands of **small files are copied in parallel**.
   `cb` walks them one at a time.
 - **Cross-filesystem moves are verified before the source is deleted.** Copy,
-  fsync the destination, then unlink. `cb` deletes originals after a copy it never
-  re-checked.
+  fsync the destination, then unlink. The original `cb` deletes originals after a copy it never
+  verified.
 - **Symlinks are recreated, never followed**, and permission bits are preserved
   on everything that has a mode.
 

@@ -6,8 +6,9 @@ const DATA: &str = "data";
 const METADATA: &str = "metadata";
 const ORIGINALS: &str = "originals";
 
-/// Same on-disk layout as the C++ implementation, so entries survive a switch
-/// between the two binaries.
+/// Same state root and `originals` format as the C++ implementation. Copied
+/// files live directly under `data/`, whereas C++ `cb` nests them under
+/// `data/<entry>/`, so each tool sees its own data.
 pub struct Clipboard {
     pub root: PathBuf,
 }

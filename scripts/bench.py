@@ -125,7 +125,7 @@ def cb_paste(bin, dest):
         os.close(master)
 
 
-RS = Impl("cb-rs", os.path.join(ROOT, "target/release/cb-rs"),
+RS = Impl("cb-rs", os.path.join(ROOT, "target/release/cb"),
           lambda bin, dest: run([bin, "paste", "-d", dest]))
 CB = Impl("cb", "cb", cb_paste)
 IMPLS = (RS, CB)
