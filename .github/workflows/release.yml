@@ -20,7 +20,7 @@ jobs:
 
       # goreleaser's rust builder is cargo zigbuild, and it installs neither
       # zig nor cargo-zigbuild itself.
-      - uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
+      - uses: xyzzylabs/setup-zig@v1
 
       - name: install cargo-zigbuild
         env:
