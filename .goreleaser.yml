@@ -1,0 +1,60 @@
+version: 2
+
+project_name: cb-rs
+
+builds:
+  - id: cb
+    builder: rust
+    command: build
+    binary: cb
+    targets:
+      - x86_64-unknown-linux-gnu
+
+archives:
+  - id: cb
+    ids: [ cb ]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- if eq .Os "darwin" }}macOS
+      {{- else if eq .Os "linux" }}Linux
+      {{- else }}{{ .Os }}{{ end }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - formats: ['tar.zst']
+
+nfpms:
+  - id: cb
+    package_name: cb-rs
+    ids: [ cb ]
+    formats:
+      - deb
+      - rpm
+    maintainer: Michael Adler <therisen06@gmail.com>
+    homepage: https://github.com/michaeladler/cb-rs
+    description: faster, safer Rust rewrite of the file copy/cut/paste core of cb
+    section: utils
+    priority: optional
+
+checksum:
+  name_template: 'checksums.txt'
+
+release:
+  draft: true
+  replace_existing_draft: true
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: "^.*feat[(\\w)]*:+.*$"
+      order: 0
+    - title: "Bug fixes"
+      regexp: "^.*fix[(\\w)]*:+.*$"
+      order: 1
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
