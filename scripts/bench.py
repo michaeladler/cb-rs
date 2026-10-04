@@ -7,16 +7,25 @@ whole tree: the copy rows would compare a path-list write against a data copy.
 The round trip is the work a user actually asks for, and both binaries are
 built around it.
 
-Two filesystems are in play: WORK is tmpfs (RAM), VOL is the loop volume
-($CB_BENCH_VOL, ./mount-btrfs by default). Each clipboard staging directory is placed next to the data it moves,
-so "same fs" means same fs for both binaries.
+Two filesystems are in play: WORK is $HOME/bench on whatever the machine
+already has, VOL is the loop volume ($CB_BENCH_VOL, ./mount-btrfs by default).
+Each clipboard staging directory is placed next to the data it moves, so
+"same fs" means same fs for both binaries.
 
-    local   : tmpfs source -> tmpfs clipboard -> tmpfs destination
-    crossfs : tmpfs source -> tmpfs clipboard -> btrfs destination
-    reflink : btrfs source -> btrfs clipboard -> btrfs destination
+    local   : WORK source -> WORK clipboard -> WORK destination
+    crossfs : WORK source -> WORK clipboard -> VOL destination
+    reflink : VOL source -> VOL clipboard -> VOL destination
 
-Needs $HOME/bench to be a tmpfs and the loop volume mounted (scripts/testvol.sh
-btrfs or xfs). The bench workflow does both and publishes the output on gh-pages.
+WORK is a real filesystem, and on the CI runner that is ext4, which is the point:
+ext4 is both a real device and without FICLONE, so "local" is a plain same-fs
+copy. A tmpfs WORK would measure a memcpy into RAM, and a btrfs or xfs WORK
+would turn the local big row into a reflink row, because cb-rs reaches FICLONE
+(src/copy.rs) before it copies anything. Both banners read the filesystem back
+with findmnt, so a run that landed somewhere else says so.
+
+Needs NEED bytes free on WORK and the loop volume mounted (scripts/testvol.sh
+btrfs or xfs). The bench workflow does both and publishes the output on
+gh-pages.
 
 Usage: CB_BENCH_VOL=./mount-xfs scripts/bench.py [reps]
 """
@@ -35,10 +44,19 @@ WORK = os.path.join(os.environ["HOME"], "bench")
 VOL = os.environ.get("CB_BENCH_VOL") or os.path.join(ROOT, "mount-btrfs")
 VOL_WORK = os.path.join(VOL, "bench")
 VOL_FS = "?"  # resolved in main(), once VOL exists: findmnt needs the path
+WORK_FS = "?"  # same, for $HOME/bench
 BIG = 512 << 20
 SMALL_LOCAL = 20000
 SMALL_CROSS = 4000
 REPS = 5
+RET = 5  # round trips in the retention row, none of them emptied in between
+COW = ("btrfs", "xfs", "zfs")  # filesystems where FICLONE answers
+
+# cb stages a 512 MiB copy per retention round trip and never frees one, and the
+# paste writes a second, so that row peaks at 2 * RET * BIG on WORK. Running out
+# of room twenty minutes in costs the whole run, so the free space is asked for
+# before the first row rather than discovered at the last one.
+NEED = 2 * RET * BIG + (1 << 30)  # plus a gigabyte for the fixtures
 
 # cb paste holds the pty open past its own exit by way of children that outlive
 # it, so the drain needs a ceiling or the run waits out the workflow timeout.
@@ -47,6 +65,10 @@ LIMIT = 120.0
 GAP = 5.0  # poll interval only; a quiet read is not a reason to give up
 
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+
+# LC_ALL=C: a comma decimal separator would put "2,6G" in the table next to the
+# "2.6G" of a differently localised run, and both end up in one published log.
+C_LOCALE = dict(os.environ, LC_ALL="C")
 
 
 # ----------------------------------------------------------------- binaries
@@ -112,10 +134,8 @@ def mk_big(d, name, size):
 
 
 def du(path):
-    # LC_ALL=C: a comma decimal separator would put "4,0K" in the table next to
-    # the "4.0K" of a differently localised run.
     out = subprocess.run(["du", "-sh", path], capture_output=True, text=True,
-                         env=dict(os.environ, LC_ALL="C"))
+                         env=C_LOCALE)
     return out.stdout.split()[0] if out.stdout.strip() else "-"
 
 
@@ -296,15 +316,25 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(VOL_WORK, exist_ok=True)
-    global VOL_FS
+    global VOL_FS, WORK_FS
     VOL_FS = fs_of(VOL)
+    WORK_FS = fs_of(WORK)
+    free = os.statvfs(WORK).f_bavail * os.statvfs(WORK).f_frsize
+    if free < NEED:
+        sys.exit("%s: %d GiB free on WORK, the retention row needs %d GiB"
+                 % (WORK_FS, free >> 30, NEED >> 30))
     for impl in IMPLS:
         impl.use_clip(os.path.join(WORK, "rsstate" if impl is RS else "cbclip"))
 
     src = os.path.join(WORK, "src")
     d_r, d_c = os.path.join(WORK, "d_r"), os.path.join(WORK, "d_c")
 
-    banner("local: tmpfs -> tmpfs")
+    # A CoW WORK answers FICLONE, so the local big row would be a reflink row
+    # wearing the wrong name. Named here rather than skipped: the number is
+    # real, it just is not the plain copy the banner's "local" implies.
+    banner("local: %s -> %s%s" % (WORK_FS, WORK_FS,
+                                  ", reflink answers FICLONE"
+                                  if WORK_FS in COW else ""))
     for d in (src, d_r, d_c):
         rm_rf(d)
         os.makedirs(d)
@@ -321,19 +351,19 @@ def main():
     for d in (d_r, d_c, os.path.join(WORK, "cutsrc")):
         rm_rf(d)
 
-    banner("cross-fs: tmpfs -> %s" % VOL_FS)
+    banner("cross-fs: %s -> %s" % (WORK_FS, VOL_FS))
     dr, dc = os.path.join(VOL_WORK, "d_r"), os.path.join(VOL_WORK, "d_c")
     rm_rf(src)
     for d in (src, dr, dc):
         os.makedirs(d, exist_ok=True)
     mk_big(os.path.join(src, "x"), "big.img", BIG)
     mk_small(os.path.join(src, "y"), SMALL_CROSS, 4 * 1024)
-    # Both clipboards sit on $WORK (tmpfs) here, so the copy half of the round
-    # trip is tmpfs to tmpfs for both binaries; "cross-fs" describes the paste.
+    # Both clipboards sit on $WORK here, so the copy half of the round trip is
+    # $WORK to $WORK for both binaries; "cross-fs" describes the paste.
     sweep(os.path.join(src, "x"), dr, dc, "%dM" % (BIG >> 20), 1)
     sweep(os.path.join(src, "y"), dr, dc, "4k x%d" % SMALL_CROSS, SMALL_CROSS)
 
-    banner("cross-fs cut+paste: tmpfs -> %s" % VOL_FS)
+    banner("cross-fs cut+paste: %s -> %s" % (WORK_FS, VOL_FS))
     cut_bench("x", dr, dc)
     cut_bench("y", dr, dc)
 
@@ -347,13 +377,14 @@ def main():
     mk_big(bsrc, "big.img", BIG)
     # A reflink row on a filesystem without FICLONE is a copy row wearing the
     # wrong name, so the shape is skipped rather than renamed.
-    if VOL_FS not in ("btrfs", "xfs", "zfs"):
+    if VOL_FS not in COW:
         print("skipped: %s has no FICLONE, so this would be a plain copy"
               % VOL_FS)
     else:
         sweep(bsrc, dr, dc, "%dM" % (BIG >> 20), 1)
 
-    banner("retention: 5 copy+paste round trips, nothing emptied in between")
+    banner("retention: %d copy+paste round trips, nothing emptied in between"
+           % RET)
     # Round trips above empty the clipboard first, so the entry a copy leaves
     # behind never lands on the clock. This is the other half of the trade: five
     # round trips in a row cost cb-rs five rewrites of two small lists and cost
@@ -368,7 +399,6 @@ def main():
     # destination directory, so all five do real work: pasting the same name
     # five times would hit --on-conflict skip from the second on and time the
     # skip, not the copy.
-    RET = 5
     for i in range(RET):
         mk_big(ret, "big%d.img" % i, BIG)
     for impl in IMPLS:
@@ -382,9 +412,9 @@ def main():
             rm_rf(slot)
             os.makedirs(slot, exist_ok=True)
 
-        # One repetition, not REPS: cb stages a 512 MiB copy per round trip and
-        # frees none of them, so five repetitions would stage 12.5 GiB and the
-        # run would be measuring tmpfs. The time here is one pass, and the du is
+        # One repetition, not REPS: cb stages a 512 MiB copy per round trip
+        # and frees none of them, so REPS passes would stage 2.5 GiB each and
+        # time the device filling up. The time here is one pass, and the du is
         # the real subject anyway.
         med, low, _ = timed(steps, [fresh], reps=1)
         print("copy+paste x%d %-6s %4d ms   min %4d ms   clipboard now holds cb-rs %-6s cb %-6s"
@@ -394,7 +424,7 @@ def main():
     rm_rf(ret)
 
     banner("space")
-    subprocess.run(["df", "-h", WORK, VOL])
+    subprocess.run(["df", "-h", WORK, VOL], env=C_LOCALE)
 
 
 if __name__ == "__main__":
