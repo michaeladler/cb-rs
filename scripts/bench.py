@@ -112,7 +112,10 @@ def mk_big(d, name, size):
 
 
 def du(path):
-    out = subprocess.run(["du", "-sh", path], capture_output=True, text=True)
+    # LC_ALL=C: a comma decimal separator would put "4,0K" in the table next to
+    # the "4.0K" of a differently localised run.
+    out = subprocess.run(["du", "-sh", path], capture_output=True, text=True,
+                         env=dict(os.environ, LC_ALL="C"))
     return out.stdout.split()[0] if out.stdout.strip() else "-"
 
 
@@ -175,16 +178,17 @@ IMPLS = (RS, CB)
 
 # -------------------------------------------------------------------- timing
 
-def timed(cmds, reset=None):
+def timed(cmds, reset=None, reps=None):
     """Median, minimum, and return code of cmds run back to back on one clock.
 
     cmds is always a list, even for a single command: one argv is itself a list
     of strings, so a bare list would be ambiguous. reset runs untimed before
-    each repetition; it may be a list of callables.
+    each repetition; it may be a list of callables. reps defaults to REPS and
+    drops to 1 where each repetition costs real disk.
     """
     reset = reset or []
     times, rc = [], 0
-    for _ in range(REPS):
+    for _ in range(REPS if reps is None else reps):
         for step in reset:
             step()
         start = time.perf_counter_ns()
@@ -349,20 +353,44 @@ def main():
     else:
         sweep(bsrc, dr, dc, "%dM" % (BIG >> 20), 1)
 
-    banner("retention: 5 copies in a row, nothing emptied in between")
+    banner("retention: 5 copy+paste round trips, nothing emptied in between")
     # Round trips above empty the clipboard first, so the entry a copy leaves
-    # behind never lands on the clock. This is the other half of the trade: it
-    # costs cb-rs nothing and costs cb a staged copy that is never freed, which
-    # the du columns read.
+    # behind never lands on the clock. This is the other half of the trade: five
+    # round trips in a row cost cb-rs five rewrites of two small lists and cost
+    # cb five staged copies that are never freed, which the du columns read.
+    # Every entry is copied and pasted, never copied alone: cb stages its bytes
+    # at copy time and cb-rs does not, so a copy-only row compares a path-list
+    # write against a data copy.
     for impl in IMPLS:
         impl.use_clip(os.path.join(WORK, "rsstate" if impl is RS else "cbclip"))
     ret = os.path.join(WORK, "ret")
-    mk_big(ret, "big.img", BIG)
+    # One source and one destination name per round trip, all in the same
+    # destination directory, so all five do real work: pasting the same name
+    # five times would hit --on-conflict skip from the second on and time the
+    # skip, not the copy.
+    RET = 5
+    for i in range(RET):
+        mk_big(ret, "big%d.img" % i, BIG)
     for impl in IMPLS:
-        med, low, _ = timed([impl.copy(ret)])
-        print("copy x5 %-6s %4d ms   min %4d ms   clipboard now holds cb-rs %-6s cb %-6s"
-              % (impl.name, med, low, du(RS.clip), du(CB.clip)))
+        slot = os.path.join(WORK, "ret_" + impl.name)
+        steps = []
+        for i in range(RET):
+            steps += [impl.copy(os.path.join(ret, "big%d.img" % i)),
+                      impl.paste(slot)]
+
+        def fresh(slot=slot):
+            rm_rf(slot)
+            os.makedirs(slot, exist_ok=True)
+
+        # One repetition, not REPS: cb stages a 512 MiB copy per round trip and
+        # frees none of them, so five repetitions would stage 12.5 GiB and the
+        # run would be measuring tmpfs. The time here is one pass, and the du is
+        # the real subject anyway.
+        med, low, _ = timed(steps, [fresh], reps=1)
+        print("copy+paste x%d %-6s %4d ms   min %4d ms   clipboard now holds cb-rs %-6s cb %-6s"
+              % (RET, impl.name, med, low, du(RS.clip), du(CB.clip)))
         rm_rf(impl.clip)
+        rm_rf(slot)
     rm_rf(ret)
 
     banner("space")

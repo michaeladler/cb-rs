@@ -14,9 +14,9 @@ copy+paste small cb        958 ms   min    958   20000 files
 cut+paste small cb-rs        1 ms   min      1   20000 files
 cut+paste small cb         1175 ms   min   1175   20000 files
 
-== retention: 5 copies in a row
-copy x5 cb-rs   558 ms   min  558 ms   clipboard now holds cb-rs 512M   cb 4.0K
-copy x5 cb     1069 ms   min 1069 ms   clipboard now holds cb-rs 0      cb 513M
+== retention: 5 copy+paste round trips
+copy+paste x5 cb-rs   558 ms   min  558 ms   clipboard now holds cb-rs 512M   cb 4.0K
+copy+paste x5 cb     1069 ms   min 1069 ms   clipboard now holds cb-rs 0      cb 513M
 
 == space
 """
@@ -29,8 +29,8 @@ class Test(unittest.TestCase):
             ("copy+paste", "small", "cb-rs", 634, 634, "recorded"))
         # retention rows carry a "ms" after the minimum
         self.assertEqual(
-            benchhtml.row("copy x5 cb     1069 ms   min 1069 ms   clipboard now holds cb 0"),
-            ("copy", "x5", "cb", 1069, 1069, "clipboard now holds cb 0"))
+            benchhtml.row("copy+paste x5 cb  1069 ms   min 1069 ms   clipboard now holds cb 0"),
+            ("copy+paste", "x5", "cb", 1069, 1069, "clipboard now holds cb 0"))
         # headers, notes and empty lines are not rows
         for ln in ("fixture: 20000 small files,", "Filesystem  Size  Used",
                    "== local: tmpfs", "", "--- cut+paste small -> /x"):
@@ -41,7 +41,8 @@ class Test(unittest.TestCase):
         got = {(e.op, e.workload): e.got for e in entries}
         self.assertEqual(got[("copy+paste", "small")],
                          {"cb-rs": (634, 634), "cb": (958, 958)})
-        self.assertEqual(got[("copy", "x5")], {"cb-rs": (558, 558), "cb": (1069, 1069)})
+        self.assertEqual(got[("copy+paste", "x5")],
+                         {"cb-rs": (558, 558), "cb": (1069, 1069)})
         # cut+paste rows interleave with the copy+paste table above them, they
         # still pair up on their own op
         self.assertEqual(got[("cut+paste", "small")],
@@ -100,11 +101,21 @@ class Test(unittest.TestCase):
         # The retention block does not go through row(): it prints its own line,
         # with the unit on the minimum too.
         with contextlib.redirect_stdout(io.StringIO()) as f:
-            print("copy x5 %-6s %4d ms   min %4d ms   clipboard now holds"
+            print("copy+paste x5 %-6s %4d ms   min %4d ms   clipboard now holds"
                   " cb-rs %-6s cb %-6s" % ("cb", 1069, 1069, "0", "513M"))
         self.assertEqual(benchhtml.row(f.getvalue()),
-                         ("copy", "x5", "cb", 1069, 1069,
+                         ("copy+paste", "x5", "cb", 1069, 1069,
                           "clipboard now holds cb-rs 0 cb 513M"))
+
+    def test_no_row_times_a_copy_or_cut_on_its_own(self):
+        """A copy-only row scores cb-rs writing a path list against cb staging
+        the bytes, which is not a comparison of round trips."""
+        with open(os.path.join(os.path.dirname(__file__), "..", "scripts",
+                               "bench.py")) as f:
+            src = f.read()
+        self.assertEqual(src.count("impl.copy(") + src.count("impl.cut("),
+                         src.count("impl.paste("))
+        self.assertNotIn("copy x5", src)
 
     def test_cb_paste_drains_a_slow_child(self):
         """cb_paste must keep reading until EOF, not until the child goes quiet.

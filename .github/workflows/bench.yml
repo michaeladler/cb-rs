@@ -45,12 +45,13 @@ jobs:
           echo "$RUNNER_TEMP/cb/bin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/cb/lib" >> "$GITHUB_ENV"
 
-      # The local rows are tmpfs -> tmpfs. 8 GiB holds the retention section,
-      # where cb materialises the holes of five 512 MiB copies (2.6 GB).
+      # The local rows are tmpfs -> tmpfs. 12 GiB holds the retention round
+      # trips, where cb materialises five staged 512 MiB copies (2.6 GB) that it
+      # never frees, plus the 2.6 GB they paste.
       - name: mount the tmpfs the local rows need
         run: |
           mkdir -p "$HOME/bench"
-          sudo mount -t tmpfs -o size=8G tmpfs "$HOME/bench"
+          sudo mount -t tmpfs -o size=12G tmpfs "$HOME/bench"
 
       - run: cargo build --release
 

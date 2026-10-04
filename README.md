@@ -143,7 +143,7 @@ Caveats above cover the semantics; this is where the speed comes from.
 ## Benchmarks
 
 `scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 over three shapes: local (tmpfs → tmpfs), cross-filesystem (tmpfs → loop volume), and reflink (loop volume → loop volume). The volume is `./mount-btrfs` by default and `CB_BENCH_VOL` elsewhere, so the same script runs against `./mount-xfs`. Each row is a whole `copy` + `paste` or `cut` + `paste` round trip on one clock, because that is the unit a user asks for: `cb-rs` records paths, so timing its `copy` alone measures a path-list write while `cb`'s copies the data. The round trip is also where the two designs differ honestly — `cb` moves the bytes twice, `cb-rs` once.
-It also runs a retention round — five copies in a row with nothing emptied in between — which is where recording paths shows up as reclaimed disk, since `cb-rs` overwrites two small lists where `cb` stages a fresh `data/N` every time and never frees the last one.
+It also runs a retention round — five `copy` + `paste` round trips in a row with nothing emptied in between — which is where recording paths shows up as reclaimed disk, since `cb-rs` overwrites two small lists where `cb` stages a fresh `data/N` for every round trip and never frees the last one.
 The `bench` workflow runs it weekly against both loop volumes, one run each, and publishes the results at <https://michaeladler.github.io/cb-rs/>.
 
 ### Measured
@@ -171,6 +171,6 @@ Read the table with its shape, not as one verdict. The local and reflink rows ar
 
 The 512 MiB cross-filesystem rows are the noisy ones: both binaries spend the run on real I/O to the loop device, and the per-run minimum swung between 200 ms and 1.3 s within a single row. Treat the median as "about a second each" and the ratio there as noise.
 
-Retention, five copies of a 512 MiB file with nothing emptied in between: `cb-rs` 1 ms and 4 KiB of clipboard, `cb` 146 ms (btrfs run) / 192 ms (xfs run) and 2.6 GiB of staged copy it never frees.
+Retention, five `copy` + `paste` round trips of 512 MiB files with nothing emptied in between (btrfs run, one repetition: `cb` stages a fresh copy for every round trip and `cb-rs` re-records the same lists, so the du columns are the point and the timings only say both binaries did the work): `cb-rs` 806 ms and 4 KiB of clipboard, `cb` 1696 ms and 2.6 GiB of staged copies it never frees.
 
-Since `copy` and `cut` only record paths, recording 20 000 files or a 512 MiB file is the same handful of microseconds either way: there is no data to read. The data cost lands entirely on `paste`, which walks the tree with the copy ladder — and on `cb`'s `copy`, which stages it first.
+Since `copy` and `cut` only record paths, recording 20 000 files or a 512 MiB file is the same handful of microseconds either way: there is no data to read. That is why no row in the table times a `copy` or a `cut` on its own — the data cost lands on `paste`, which walks the tree with the copy ladder, and on `cb`'s `copy`, which stages it first, and a copy-only row would score one of those against the other.
