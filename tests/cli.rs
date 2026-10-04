@@ -17,11 +17,22 @@ struct Run {
     stderr: String,
 }
 
+/// A path that cannot exist, so `copy` always has a source to fail on.
+fn missing_source() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("cb-cli-absent-{}", std::process::id()))
+}
+
 fn run(args: &[&str]) -> Run {
     let out = Command::new(env!("CARGO_BIN_EXE_cb"))
         .args(args)
         // A throwaway state root, so no test reads or writes the real clipboard.
-        .env("CLIPBOARD_PERSISTDIR", "/nonexistent/cb-cli-test-state")
+        // Must be writable: `/nonexistent` is user-owned on some systems and
+        // missing on others, and cb fails before reporting anything if it
+        // cannot create the state directory.
+        .env(
+            "CLIPBOARD_PERSISTDIR",
+            std::env::temp_dir().join(format!("cb-cli-state-{}", std::process::id())),
+        )
         .output()
         .unwrap();
     Run {
@@ -162,7 +173,7 @@ fn usage_errors_exit_2_and_go_to_stderr() {
 /// Runtime failures stay on exit 1, distinct from usage errors.
 #[test]
 fn runtime_failures_exit_1() {
-    let got = expect(&["copy", "/nonexistent/cb-cli-test-src"], 1);
+    let got = expect(&["copy", &missing_source().to_string_lossy()], 1);
     assert!(got.stdout.contains("1 failed"), "{got:?}");
     assert!(got.stderr.starts_with("cb: "), "{got:?}");
 }
@@ -182,7 +193,7 @@ fn doc_generators_are_gone() {
 
 #[test]
 fn double_dash_ends_option_parsing() {
-    expect(&["copy", "--", "/nonexistent/cb-cli-test-src"], 1);
+    expect(&["copy", "--", &missing_source().to_string_lossy()], 1);
 }
 
 /// A clipboard is two path lists, so one paste can move some entries and copy
