@@ -167,11 +167,13 @@ def landed(path, expected):
 
 def recorded(impl, src):
     """cb-rs records the source path instead of staging bytes, so the
-    post-condition of a copy is a line in metadata/copies. The file count is no
-    longer knowable here -- nothing has been read yet -- but the paste row
-    verifies it."""
-    listing = os.path.join(impl.clip, "0/metadata/copies")
-    got = open(listing).read().splitlines() if os.path.exists(listing) else []
+    post-condition of a copy is a line in the clipboard. `list` is asked rather
+    than the state file read, so this does not track the state layout. The file
+    count is no longer knowable here -- nothing has been read yet -- but the
+    paste row verifies it."""
+    out = subprocess.run([impl.bin, "list"], capture_output=True, text=True)
+    got = [line.split("\t", 1)[1] for line in out.stdout.splitlines()
+           if "\t" in line]
     if os.path.realpath(src) in [os.path.realpath(p) for p in got]:
         return "recorded"
     return "!! %s not recorded" % src
