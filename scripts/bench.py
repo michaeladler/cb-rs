@@ -7,18 +7,18 @@ whole tree: the copy rows would compare a path-list write against a data copy.
 The round trip is the work a user actually asks for, and both binaries are
 built around it.
 
-Two filesystems are in play: WORK is tmpfs (RAM), ./mount-btrfs is the btrfs loop
-volume. Each clipboard staging directory is placed next to the data it moves,
+Two filesystems are in play: WORK is tmpfs (RAM), VOL is the loop volume
+($CB_BENCH_VOL, ./mount-btrfs by default). Each clipboard staging directory is placed next to the data it moves,
 so "same fs" means same fs for both binaries.
 
     local   : tmpfs source -> tmpfs clipboard -> tmpfs destination
     crossfs : tmpfs source -> tmpfs clipboard -> btrfs destination
     reflink : btrfs source -> btrfs clipboard -> btrfs destination
 
-Needs $HOME/bench to be a tmpfs and ./mount-btrfs mounted (scripts/testvol.sh
-btrfs). The bench workflow does both and publishes the output on gh-pages.
+Needs $HOME/bench to be a tmpfs and the loop volume mounted (scripts/testvol.sh
+btrfs or xfs). The bench workflow does both and publishes the output on gh-pages.
 
-Usage: scripts/bench.py [reps]
+Usage: CB_BENCH_VOL=./mount-xfs scripts/bench.py [reps]
 """
 
 import os
@@ -32,8 +32,8 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(os.environ["HOME"], "bench")
-VOL = os.path.join(ROOT, "mount-btrfs")
-BTRFS_WORK = os.path.join(VOL, "bench")
+VOL = os.environ.get("CB_BENCH_VOL") or os.path.join(ROOT, "mount-btrfs")
+VOL_WORK = os.path.join(VOL, "bench")
 VOL_FS = "?"  # resolved in main(), once VOL exists: findmnt needs the path
 BIG = 512 << 20
 SMALL_LOCAL = 20000
@@ -291,7 +291,7 @@ def main():
     # fd 1, so unbuffered puts df output back under the banner that asked for it.
     sys.stdout.reconfigure(line_buffering=True)
     os.makedirs(WORK, exist_ok=True)
-    os.makedirs(BTRFS_WORK, exist_ok=True)
+    os.makedirs(VOL_WORK, exist_ok=True)
     global VOL_FS
     VOL_FS = fs_of(VOL)
     for impl in IMPLS:
@@ -318,7 +318,7 @@ def main():
         rm_rf(d)
 
     banner("cross-fs: tmpfs -> %s" % VOL_FS)
-    dr, dc = os.path.join(BTRFS_WORK, "d_r"), os.path.join(BTRFS_WORK, "d_c")
+    dr, dc = os.path.join(VOL_WORK, "d_r"), os.path.join(VOL_WORK, "d_c")
     rm_rf(src)
     for d in (src, dr, dc):
         os.makedirs(d, exist_ok=True)
@@ -334,12 +334,12 @@ def main():
     cut_bench("y", dr, dc)
 
     banner("reflink: %s -> %s" % (VOL_FS, VOL_FS))
-    bsrc = os.path.join(BTRFS_WORK, "src")
+    bsrc = os.path.join(VOL_WORK, "src")
     for d in (bsrc, dr, dc):
         rm_rf(d)
         os.makedirs(d, exist_ok=True)
     for impl in IMPLS:
-        impl.use_clip(os.path.join(BTRFS_WORK, "rsstate" if impl is RS else "cbclip"))
+        impl.use_clip(os.path.join(VOL_WORK, "rsstate" if impl is RS else "cbclip"))
     mk_big(bsrc, "big.img", BIG)
     # A reflink row on a filesystem without FICLONE is a copy row wearing the
     # wrong name, so the shape is skipped rather than renamed.
