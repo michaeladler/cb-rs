@@ -2,15 +2,17 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_NAME: &str = "0";
-const DATA: &str = "data";
+/// Own state directory, deliberately not the C++ `cb`'s `clipboard/`: sharing it
+/// means a `cut` here wipes the other tool's staged bytes, since a new cut
+/// resets the whole clipboard entry.
+pub const STATE_DIR: &str = "cb-rs";
 const METADATA: &str = "metadata";
 const ORIGINALS: &str = "originals";
 const COPIES: &str = "copies";
 
-/// Same state root and `originals` format as the C++ implementation, so both
-/// tools read the move list the same way. `originals` holds what `paste` moves
-/// and `copies` what it copies; neither holds bytes, because neither `cut` nor
-/// `copy` reads a file. Nothing is staged, so `data/` is only a legacy wipe.
+/// `originals` holds what `paste` moves and `copies` what it copies; neither
+/// holds bytes, because neither `cut` nor `copy` reads a file, so nothing is
+/// staged anywhere.
 pub struct Clipboard {
     pub root: PathBuf,
 }
@@ -22,14 +24,12 @@ impl Clipboard {
         }
     }
 
-    /// Absolute sources `paste` moves, one per line. The C++ `cb` reads this
-    /// same file with the same meaning.
+    /// Absolute sources `paste` moves, one per line.
     pub fn originals(&self) -> PathBuf {
         self.root.join(METADATA).join(ORIGINALS)
     }
 
-    /// Absolute sources `paste` copies, one per line. cb-rs only: the C++ `cb`
-    /// stages copied bytes instead and so has no such list.
+    /// Absolute sources `paste` copies, one per line.
     pub fn copies(&self) -> PathBuf {
         self.root.join(METADATA).join(COPIES)
     }
@@ -38,11 +38,8 @@ impl Clipboard {
         std::fs::create_dir_all(self.root.join(METADATA))
     }
 
-    /// A new copy or cut replaces the whole clipboard entry. `data/` is no
-    /// longer written, but a version that did write it left real bytes on disk,
-    /// so reclaim them here rather than leaking them on upgrade.
+    /// A new copy or cut replaces the whole clipboard entry.
     pub fn reset(&self) -> std::io::Result<()> {
-        let _ = std::fs::remove_dir_all(self.root.join(DATA));
         let _ = std::fs::remove_file(self.originals());
         let _ = std::fs::remove_file(self.copies());
         self.ensure()
@@ -77,9 +74,9 @@ fn state_root() -> PathBuf {
         return PathBuf::from(dir);
     }
     if let Some(dir) = env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(dir).join("clipboard");
+        return PathBuf::from(dir).join(STATE_DIR);
     }
-    home().join(".local/state/clipboard")
+    home().join(".local/state").join(STATE_DIR)
 }
 
 fn home() -> PathBuf {
