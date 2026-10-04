@@ -9,18 +9,33 @@
 {
   overlays = [ inputs.michaeladler-nurpackages.overlays.default ];
 
-  # https://devenv.sh/languages/
-  languages.rust.enable = true;
+  profiles = {
+    dev.module = {
+      languages.rust.enable = true;
+    };
 
-  packages = [
-    pkgs.btrfs-progs
-    pkgs.xfsprogs
-
-    pkgs.demo-magic
-    pkgs.asciinema
-    pkgs.agg
-    pkgs.tmux
-  ];
+    demo.module = {
+      packages = [
+        pkgs.demo-magic
+        pkgs.asciinema
+        pkgs.agg
+        pkgs.tmux
+      ];
+    };
+    test.module = {
+      packages = [
+        pkgs.btrfs-progs
+        pkgs.xfsprogs
+      ];
+    };
+    release.module = {
+      packages = [
+        pkgs.goreleaser
+        pkgs.cargo-zigbuild
+        pkgs.zig
+      ];
+    };
+  };
 
   # https://devenv.sh/git-hooks/
   git-hooks.hooks = {

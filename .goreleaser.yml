@@ -5,20 +5,16 @@ project_name: cb-rs
 builds:
   - id: cb
     builder: rust
-    command: build
+    command: zigbuild
     binary: cb
     targets:
-      # musl, not gnu: zig cc can't link glibc statically, and musl gives a
-      # fully static binary that runs on any distro, incl. Alpine/scratch.
       - x86_64-unknown-linux-musl
       - aarch64-unknown-linux-musl
-      # Cross-built from Linux by cargo-zigbuild.
-      - x86_64-apple-darwin
       - aarch64-apple-darwin
 
 archives:
   - id: cb
-    ids: [ cb ]
+    ids: [cb]
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_
       {{- if eq .Os "darwin" }}macOS
@@ -27,9 +23,7 @@ archives:
       {{- if eq .Arch "amd64" }}x86_64
       {{- else }}{{ .Arch }}{{ end }}
     format_overrides:
-      - formats: ['tar.zst']
-    # Nothing generates these at runtime any more, so ship them alongside the
-    # binary for packagers and anyone installing from a tarball.
+      - formats: ["tar.zst"]
     files:
       - src: man/*
         dst: man
@@ -39,7 +33,7 @@ archives:
 nfpms:
   - id: cb
     package_name: cb-rs
-    ids: [ cb ]
+    ids: [cb]
     formats:
       - deb
       - rpm
@@ -51,7 +45,6 @@ nfpms:
     contents:
       - src: man/cb.1
         dst: man1/cb.1
-        type: man
       - src: completions/cb.bash
         dst: bash-completion/completions/cb
         type: config
@@ -63,7 +56,7 @@ nfpms:
         type: config
 
 checksum:
-  name_template: 'checksums.txt'
+  name_template: "checksums.txt"
 
 release:
   draft: true

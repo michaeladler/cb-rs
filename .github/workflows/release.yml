@@ -1,6 +1,7 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*"
@@ -17,27 +18,41 @@ jobs:
           fetch-depth: 0
 
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
-
-      # goreleaser's rust builder is cargo zigbuild, and it installs neither
-      # zig nor cargo-zigbuild itself.
-      - uses: xyzzylabs/setup-zig@ab632f9cc6f98d89d3b8f2c2e1577a929d0e70f3 # v1.0.4
-
-      - name: install cargo-zigbuild
-        env:
-          VERSION: v0.23.4
-        run: |
-          set -euo pipefail
-          base=https://github.com/rust-cross/cargo-zigbuild/releases/download/$VERSION
-          a=cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz
-          curl -fsSL -o "$a" "$base/$a"
-          curl -fsSL -o "$a.sha256" "$base/$a.sha256"
-          echo "$(awk '{print $1}' "$a.sha256")  $a" | sha256sum -c -
-          tar -C "$HOME/.cargo/bin" --strip-components=1 -xf "$a"
-
-      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          distribution: goreleaser
-          version: '~> v2'
-          args: release --clean
+          # cargo-zigbuild lazily runs `rustup component add rust-src` per build
+          # target. goreleaser builds in parallel, so two targets race the same
+          # download and one dies on a missing `.partial` file.
+          components: rust-src
+          target: |
+            x86_64-unknown-linux-musl
+            aarch64-unknown-linux-musl
+            aarch64-apple-darwin
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv.sh
+        run: nix profile add nixpkgs#devenv
+
+      - name: goreleaser
+        shell: devenv shell --profile release -- bash -e {0}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            goreleaser release --clean
+          else
+            goreleaser release --clean --snapshot --skip=publish,sign
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload snapshot dist
+        if: "!startsWith(github.event.ref, 'refs/tags/v')"
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-snapshot
+          path: dist/
+          retention-days: 1
