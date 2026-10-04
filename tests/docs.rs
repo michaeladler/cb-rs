@@ -43,6 +43,47 @@ fn completions_cover_every_subcommand() {
     }
 }
 
+/// The README is the only place some of this is written down, so the facts that
+/// already drifted once are pinned here: the state directory, the global `-n`,
+/// `list`'s output shape, and the exit codes. Each assertion below is a claim
+/// that was once wrong or missing, not a restatement of the prose.
+#[test]
+fn readme_states_the_contracts_it_used_to_get_wrong() {
+    let readme = read("README.md");
+    let paths = read("src/paths.rs");
+
+    // The state directory is a constant in the code: check the two agree rather
+    // than hardcoding "cb-rs" twice.
+    let dir = paths
+        .lines()
+        .find_map(|l| l.split("STATE_DIR: &str = \"").nth(1))
+        .and_then(|l| l.split('"').next())
+        .expect("src/paths.rs does not define STATE_DIR");
+    assert!(
+        readme.contains(&format!("{dir}/<name>")),
+        "README does not document the state directory {dir}/<name>:\n{readme}"
+    );
+    assert!(
+        !readme.contains("clipboard/<name>"),
+        "README still points at the C++ cb's state directory:\n{readme}"
+    );
+
+    for expected in [
+        "-n`/`--name",
+        "`--name <NAME>`",
+        "`2` for a usage error",
+        "`1` for a runtime failure",
+        // The `list` sample carries real tabs, as `cb list` emits.
+        "cut\t",
+        "copy\t",
+    ] {
+        assert!(
+            readme.contains(expected),
+            "README is missing {expected:?}:\n{readme}"
+        );
+    }
+}
+
 #[test]
 fn man_page_documents_the_commands() {
     let man = read("man/cb.1");
