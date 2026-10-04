@@ -23,7 +23,6 @@ Usage: scripts/bench.py [reps]
 
 import os
 import pty
-import select
 import shutil
 import statistics
 import subprocess
@@ -131,9 +130,12 @@ def cb_paste(bin, dest):
         os.close(slave)  # the child holds the only other copy: dropping it here
                          # is what lets the read below reach EOF
         os.write(master, b"n\n" * 200)
-        # cb only prompts on a tty, so its output cannot go to /dev/null. Drain
-        # to EOF; a blocking read would work here, but the EOF read raises.
-        while select.select([master], [], [], 5)[0]:
+        # cb only prompts on a tty, so its output cannot go to /dev/null. Read
+        # to EOF; the EOF read raises, hence the except. No select timeout: a
+        # gap longer than any timeout here means cb is thinking, not gone, and
+        # bailing out early leaves the pty undrained -- cb then blocks writing
+        # into a full buffer and p.wait() blocks forever.
+        while True:
             try:
                 if not os.read(master, 65536):
                     break

@@ -1,4 +1,4 @@
-import contextlib, io, os, re, sys, unittest
+import contextlib, io, os, re, shutil, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import bench
 import benchhtml
@@ -105,6 +105,33 @@ class Test(unittest.TestCase):
         self.assertEqual(benchhtml.row(f.getvalue()),
                          ("copy", "x5", "cb", 1069, 1069,
                           "clipboard now holds cb-rs 0 cb 513M"))
+
+    def test_cb_paste_drains_a_slow_child(self):
+        """cb_paste must keep reading until EOF, not until the child goes quiet.
+
+        A drain with a timeout abandons the pty on a gap longer than the
+        timeout; the child then blocks writing into a full buffer and the wait
+        never returns. The gap here is 6s, past the 5s that used to be there.
+        """
+        d = tempfile.mkdtemp()
+        # cb_paste runs [bin, "paste"], so the child is an executable script
+        # that ignores the argument rather than a -c string.
+        child = os.path.join(d, "slow")
+        with open(child, "w") as f:
+            f.write("#!/usr/bin/env python3\n"
+                    "import sys, time\n"
+                    "sys.argv[1:]\n"
+                    "time.sleep(6)\n"          # quiet past the 5s that was there
+                    "for _ in range(4000):\n"
+                    "    print('x' * 200)\n"  # ~800 KB: overflows the pty buffer
+                    "time.sleep(1)\n")
+        os.chmod(child, 0o755)
+        dest = os.path.join(d, "dest")
+        os.makedirs(dest)
+        try:
+            self.assertEqual(bench.cb_paste(child, dest), 0)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     def test_escapes(self):
         out = benchhtml.render("== a\ncopy x cb-rs 1 ms min 1 &<>\"'\n")
