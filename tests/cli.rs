@@ -184,3 +184,139 @@ fn doc_generators_are_gone() {
 fn double_dash_ends_option_parsing() {
     expect(&["copy", "--", "/nonexistent/cb-cli-test-src"], 1);
 }
+
+/// A clipboard is two path lists, so one paste can move some entries and copy
+/// others. Nothing is read at record time, which is what makes this cheap
+/// enough to be the normal case.
+struct Sandbox {
+    root: std::path::PathBuf,
+}
+
+impl Sandbox {
+    fn new(name: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("cb-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["work", "out", "state"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("work/moved.txt"), b"m").unwrap();
+        std::fs::create_dir_all(root.join("work/kept")).unwrap();
+        std::fs::write(root.join("work/kept/k.txt"), b"k").unwrap();
+        Self { root }
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_cb"))
+            .args(args)
+            .env("CLIPBOARD_PERSISTDIR", self.root.join("state"))
+            .current_dir(self.root.join("work"))
+            .output()
+            .unwrap()
+    }
+
+    fn ok(&self, args: &[&str]) -> std::process::Output {
+        let out = self.run(args);
+        assert!(
+            out.status.success(),
+            "{args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    fn work(&self, rel: &str) -> bool {
+        self.root.join("work").join(rel).exists()
+    }
+
+    fn out(&self, rel: &str) -> bool {
+        self.root.join("out").join(rel).exists()
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn amend_accumulates_a_move_and_a_copy_into_one_paste() {
+    let sandbox = Sandbox::new("amend");
+
+    sandbox.ok(&["cut", "moved.txt"]);
+    sandbox.ok(&["copy", "--amend", "kept"]);
+    sandbox.ok(&["paste", "-d", "../out"]);
+
+    assert!(!sandbox.work("moved.txt"), "cut entry must be moved");
+    assert!(
+        sandbox.out("moved.txt"),
+        "cut entry must land in the destination"
+    );
+    assert!(sandbox.work("kept/k.txt"), "copy entry must stay put");
+    assert!(
+        sandbox.out("kept/k.txt"),
+        "copy entry must land in the destination"
+    );
+}
+
+/// Without `--amend` a copy replaces the whole clipboard, pending move included.
+/// This is the documented wipe, and it is the reason `--amend` exists.
+#[test]
+fn a_plain_copy_discards_the_pending_move() {
+    let sandbox = Sandbox::new("replace");
+
+    sandbox.ok(&["cut", "moved.txt"]);
+    sandbox.ok(&["copy", "kept"]);
+    sandbox.ok(&["paste", "-d", "../out"]);
+
+    assert!(
+        sandbox.work("moved.txt"),
+        "the cut was replaced, so nothing moves"
+    );
+    assert!(
+        !sandbox.out("moved.txt"),
+        "a replaced move must not be pasted"
+    );
+    assert!(sandbox.work("kept/k.txt"));
+    assert!(sandbox.out("kept/k.txt"));
+}
+
+/// A copy stays recorded, so a second paste reads the source again rather than
+/// finding an empty clipboard.
+#[test]
+fn a_copy_is_not_consumed_by_pasting() {
+    let sandbox = Sandbox::new("repeat");
+
+    sandbox.ok(&["copy", "kept"]);
+    sandbox.ok(&["paste", "-d", "../out"]);
+    sandbox.ok(&["paste", "-d", "../out", "--on-conflict", "replace"]);
+
+    assert_eq!(
+        std::fs::read(sandbox.root.join("out/kept/k.txt")).unwrap(),
+        b"k"
+    );
+}
+
+/// Paths are stored absolute, because paste runs in a directory the user never
+/// named. A relative path recorded from `work` would not resolve from `out`.
+#[test]
+fn recorded_paths_do_not_depend_on_the_paste_directory() {
+    let sandbox = Sandbox::new("absolute");
+
+    sandbox.ok(&["copy", "kept"]);
+    let dest = sandbox.root.join("elsewhere");
+    std::fs::create_dir_all(&dest).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_cb"))
+        .args(["paste"])
+        .env("CLIPBOARD_PERSISTDIR", sandbox.root.join("state"))
+        .current_dir(&dest)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dest.join("kept/k.txt").exists());
+}

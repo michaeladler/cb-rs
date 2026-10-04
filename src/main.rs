@@ -52,12 +52,16 @@ impl Command {
 }
 
 #[derive(FromArgs)]
-/// Copy files into the clipboard, leaving the originals in place
+/// Record files to be copied when pasted, leaving the originals in place
 #[argh(subcommand, name = "copy", help_triggers("-h", "--help"))]
 struct Copy {
     /// clipboard to use, instead of the default.
     #[argh(option, short = 'n')]
     name: Option<String>,
+
+    /// add to the recorded paths instead of replacing them.
+    #[argh(switch, short = 'a')]
+    amend: bool,
 
     /// files or directories to copy.
     #[argh(positional)]
@@ -71,6 +75,10 @@ struct Cut {
     /// clipboard to use, instead of the default.
     #[argh(option, short = 'n')]
     name: Option<String>,
+
+    /// add to the recorded paths instead of replacing them.
+    #[argh(switch, short = 'a')]
+    amend: bool,
 
     /// files or directories to move on paste.
     #[argh(positional)]
@@ -188,11 +196,25 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Command::Copy(c) => match require_paths("copy", &c.paths) {
-            Ok(()) => do_copy(&clipboard, &c.paths),
+            Ok(()) => record(
+                &clipboard,
+                clipboard.copies(),
+                &c.paths,
+                c.amend,
+                "copy",
+                "copy",
+            ),
             Err(code) => return code,
         },
         Command::Cut(c) => match require_paths("cut", &c.paths) {
-            Ok(()) => do_cut(&clipboard, &c.paths),
+            Ok(()) => record(
+                &clipboard,
+                clipboard.originals(),
+                &c.paths,
+                c.amend,
+                "cut",
+                "move",
+            ),
             Err(code) => return code,
         },
         Command::Paste(p) => do_paste(
@@ -212,65 +234,135 @@ fn main() -> ExitCode {
     }
 }
 
-fn do_copy(clipboard: &Clipboard, items: &[PathBuf]) -> Result<(), String> {
-    clipboard.reset().map_err(|e| e.to_string())?;
-    let mut failures = Vec::new();
-    let mut copied = 0usize;
+/// `cut` and `copy` store the same thing: absolute source paths. They differ
+/// only in which list the paths land in, so `paste` knows to move or to copy
+/// them. Nothing is read here, so a recorded clipboard costs a few bytes per
+/// path no matter how large the tree is.
+fn record(
+    clipboard: &Clipboard,
+    file: PathBuf,
+    items: &[PathBuf],
+    amend: bool,
+    verb: &str,
+    future: &str,
+) -> Result<(), String> {
+    let mut sources = Vec::with_capacity(items.len());
+    let mut errors = Vec::new();
     for item in items {
-        let name = item
-            .file_name()
-            .ok_or_else(|| format!("{}: not a path", item.display()))?;
-        let dst = clipboard.data().join(name);
-        let before = failures.len();
-        failures.extend(walk::copy_any(item, &dst));
-        if failures.len() == before {
-            copied += 1;
+        // Absolute, because paste runs somewhere else: the directory a path was
+        // given in is not the one it will be resolved from.
+        match std::fs::canonicalize(item) {
+            Ok(path) => sources.push(path),
+            Err(e) => errors.push(format!("{}: {e}", item.display())),
         }
     }
-    report(copied, &failures, "copied")
-}
 
-fn do_cut(clipboard: &Clipboard, items: &[PathBuf]) -> Result<(), String> {
-    let mut sources = Vec::new();
-    for item in items {
-        let absolute =
-            std::fs::canonicalize(item).map_err(|e| format!("{}: {e}", item.display()))?;
-        sources.push(absolute);
-    }
-    clipboard.reset().map_err(|e| e.to_string())?;
+    let mut list = if amend {
+        clipboard.read_list(&file)
+    } else {
+        clipboard.reset().map_err(|e| e.to_string())?;
+        Vec::new()
+    };
+    let recorded = list.len() + sources.len();
+    list.append(&mut sources);
     clipboard
-        .set_cut_sources(&sources)
+        .write_list(&file, &list)
         .map_err(|e| e.to_string())?;
-    println!("cut {} item(s), will move on paste", sources.len());
-    Ok(())
+
+    for error in &errors {
+        eprintln!("cb: {error}");
+    }
+    let more = if amend { " more" } else { "" };
+    let failed = if errors.is_empty() {
+        String::new()
+    } else {
+        format!(", {} failed", errors.len())
+    };
+    println!("{verb} {recorded}{more} item(s), will {future} on paste{failed}");
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} failure(s)", errors.len()))
+    }
 }
 
 fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(), String> {
-    let cut = clipboard.cut_sources();
-    if cut.is_empty() {
-        return paste_copied(clipboard, dst_dir, policy);
+    let moves = clipboard.read_list(&clipboard.originals());
+    let copies = clipboard.read_list(&clipboard.copies());
+    let mut result = Ok(());
+    if !moves.is_empty() {
+        result = paste_moves(clipboard, dst_dir, policy, &moves);
     }
-    paste_cut(clipboard, &cut, dst_dir, policy)
+    if !copies.is_empty()
+        && let Err(e) = paste_copies(dst_dir, policy, &copies)
+    {
+        result = Err(e);
+    }
+    result
 }
 
-fn paste_copied(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(), String> {
-    let entries = match std::fs::read_dir(clipboard.data()) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.to_string()),
-    };
+/// Moves consume the clipboard: only the paths that did not complete stay
+/// recorded, so an interrupted paste can be retried.
+fn paste_moves(
+    clipboard: &Clipboard,
+    dst_dir: &Path,
+    policy: Policy,
+    sources: &[PathBuf],
+) -> Result<(), String> {
+    let mut remaining = Vec::new();
+    let mut moved = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    for source in sources {
+        match mover::move_into(source, dst_dir, policy) {
+            Ok(mover::Outcome::Moved) => moved += 1,
+            Ok(mover::Outcome::Skipped) => {
+                skipped += 1;
+                remaining.push(source.clone());
+            }
+            Err(e) => {
+                eprintln!("cb: {}: {e}", source.display());
+                failed += 1;
+                remaining.push(source.clone());
+            }
+        }
+    }
+    clipboard
+        .write_list(&clipboard.originals(), &remaining)
+        .map_err(|e| e.to_string())?;
+    if skipped > 0 {
+        println!("skipped {skipped} existing item(s)");
+    }
+    println!("moved {moved} item(s)");
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(format!("{failed} failure(s)"))
+    }
+}
+
+/// Copies do not consume the clipboard, so a second paste reads the same sources
+/// again. That is only sound because the source is read at paste time and not
+/// snapshotted at copy time.
+fn paste_copies(dst_dir: &Path, policy: Policy, sources: &[PathBuf]) -> Result<(), String> {
     let mut failures = Vec::new();
     let mut skipped = 0usize;
     let mut pasted = 0usize;
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let dst = dst_dir.join(entry.file_name());
+    for source in sources {
+        let Some(name) = source.file_name() else {
+            failures.push(Failure {
+                path: source.clone(),
+                reason: "no file name".to_owned(),
+            });
+            continue;
+        };
+        let dst = dst_dir.join(name);
         if dst.exists() && !policy.resolve(&dst).map_err(|e| e.to_string())? {
             skipped += 1;
             continue;
         }
         let before = failures.len();
-        failures.extend(walk::copy_any(&entry.path(), &dst));
+        failures.extend(walk::copy_any(source, &dst));
         if failures.len() == before {
             pasted += 1;
         }
@@ -281,55 +373,12 @@ fn paste_copied(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result
     report(pasted, &failures, "pasted")
 }
 
-fn paste_cut(
-    clipboard: &Clipboard,
-    sources: &[PathBuf],
-    dst_dir: &Path,
-    policy: Policy,
-) -> Result<(), String> {
-    let mut remaining = Vec::new();
-    let mut moved = 0usize;
-    let mut skipped = 0usize;
-    for source in sources {
-        match mover::move_into(source, dst_dir, policy) {
-            Ok(mover::Outcome::Moved) => moved += 1,
-            Ok(mover::Outcome::Skipped) => {
-                skipped += 1;
-                remaining.push(source.clone());
-            }
-            Err(e) => {
-                eprintln!("cb: {}: {e}", source.display());
-                remaining.push(source.clone());
-            }
-        }
-    }
-    // Only paths that did not complete stay recorded, so `paste` can be retried.
-    clipboard
-        .set_cut_sources(&remaining)
-        .map_err(|e| e.to_string())?;
-    if skipped > 0 {
-        println!("skipped {skipped} existing item(s)");
-    }
-    println!("moved {moved} item(s)");
-    Ok(())
-}
-
 fn do_list(clipboard: &Clipboard) -> Result<(), String> {
-    let cut = clipboard.cut_sources();
-    if !cut.is_empty() {
-        for source in cut {
-            println!("cut\t{}", source.display());
-        }
-        return Ok(());
+    for source in clipboard.read_list(&clipboard.originals()) {
+        println!("cut\t{}", source.display());
     }
-    let entries = match std::fs::read_dir(clipboard.data()) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.to_string()),
-    };
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        println!("{}", entry.path().display());
+    for source in clipboard.read_list(&clipboard.copies()) {
+        println!("copy\t{}", source.display());
     }
     Ok(())
 }

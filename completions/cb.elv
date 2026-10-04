@@ -24,7 +24,7 @@ set edit:completion:arg-completer[cb] = {|@words|
             cand --help 'Print help'
             cand -V 'Print version'
             cand --version 'Print version'
-            cand copy 'Copy files into the clipboard, leaving the originals in place'
+            cand copy 'Record files to be copied when pasted, leaving the originals in place'
             cand cut 'Record files to be moved when pasted. The originals stay in place until then'
             cand paste 'Write the clipboard''s files into the current directory'
             cand list 'List what the clipboard holds'
@@ -33,12 +33,16 @@ set edit:completion:arg-completer[cb] = {|@words|
         &'cb;copy'= {
             cand -n 'Clipboard to use, instead of the default'
             cand --name 'Clipboard to use, instead of the default'
+            cand -a 'add to the recorded paths instead of replacing them'
+            cand --amend 'Add to the recorded paths instead of replacing them'
             cand -h 'Print help'
             cand --help 'Print help'
         }
         &'cb;cut'= {
             cand -n 'Clipboard to use, instead of the default'
             cand --name 'Clipboard to use, instead of the default'
+            cand -a 'add to the recorded paths instead of replacing them'
+            cand --amend 'Add to the recorded paths instead of replacing them'
             cand -h 'Print help'
             cand --help 'Print help'
         }
@@ -58,7 +62,7 @@ set edit:completion:arg-completer[cb] = {|@words|
             cand --help 'Print help'
         }
         &'cb;help'= {
-            cand copy 'Copy files into the clipboard, leaving the originals in place'
+            cand copy 'Record files to be copied when pasted, leaving the originals in place'
             cand cut 'Record files to be moved when pasted. The originals stay in place until then'
             cand paste 'Write the clipboard''s files into the current directory'
             cand list 'List what the clipboard holds'

@@ -165,6 +165,18 @@ def landed(path, expected):
     return "!! expected %d files, found %d" % (expected, got)
 
 
+def recorded(impl, src):
+    """cb-rs records the source path instead of staging bytes, so the
+    post-condition of a copy is a line in metadata/copies. The file count is no
+    longer knowable here -- nothing has been read yet -- but the paste row
+    verifies it."""
+    listing = os.path.join(impl.clip, "0/metadata/copies")
+    got = open(listing).read().splitlines() if os.path.exists(listing) else []
+    if os.path.realpath(src) in [os.path.realpath(p) for p in got]:
+        return "recorded"
+    return "!! %s not recorded" % src
+
+
 def banner(title):
     print("\n\033[1m== %s\033[0m" % title)
 
@@ -185,7 +197,7 @@ def sweep(src, dr, dc, workload, expect, check_copy=False):
     name = os.path.basename(src)
     for impl in IMPLS:
         med, low, rc = timed(impl.copy(src), [empty_clip(impl)])
-        note = landed(os.path.join(impl.clip, "0/data", name), expect) if check_copy and impl is RS else ""
+        note = recorded(impl, src) if check_copy and impl is RS else ""
         row("copy", workload, impl.name, med, low, rc, note)
 
     for impl in IMPLS:

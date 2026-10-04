@@ -27,14 +27,16 @@ end
 complete -c cb -n "__fish_cb_needs_command" -s n -l name -d 'Clipboard to use, instead of the default' -r
 complete -c cb -n "__fish_cb_needs_command" -s h -l help -d 'Print help'
 complete -c cb -n "__fish_cb_needs_command" -s V -l version -d 'Print version'
-complete -c cb -n "__fish_cb_needs_command" -f -a "copy" -d 'Copy files into the clipboard, leaving the originals in place'
+complete -c cb -n "__fish_cb_needs_command" -f -a "copy" -d 'Record files to be copied when pasted, leaving the originals in place'
 complete -c cb -n "__fish_cb_needs_command" -f -a "cut" -d 'Record files to be moved when pasted. The originals stay in place until then'
 complete -c cb -n "__fish_cb_needs_command" -f -a "paste" -d 'Write the clipboard\'s files into the current directory'
 complete -c cb -n "__fish_cb_needs_command" -f -a "list" -d 'List what the clipboard holds'
 complete -c cb -n "__fish_cb_needs_command" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c cb -n "__fish_cb_using_subcommand copy" -s n -l name -d 'Clipboard to use, instead of the default' -r
+complete -c cb -n "__fish_cb_using_subcommand copy" -s a -l amend -d 'add to the recorded paths instead of replacing them'
 complete -c cb -n "__fish_cb_using_subcommand copy" -s h -l help -d 'Print help'
 complete -c cb -n "__fish_cb_using_subcommand cut" -s n -l name -d 'Clipboard to use, instead of the default' -r
+complete -c cb -n "__fish_cb_using_subcommand cut" -s a -l amend -d 'add to the recorded paths instead of replacing them'
 complete -c cb -n "__fish_cb_using_subcommand cut" -s h -l help -d 'Print help'
 complete -c cb -n "__fish_cb_using_subcommand paste" -s d -l directory -d 'Destination directory, defaults to the current one' -r -F
 complete -c cb -n "__fish_cb_using_subcommand paste" -l on-conflict -d 'What to do when a destination file already exists' -r
@@ -42,7 +44,7 @@ complete -c cb -n "__fish_cb_using_subcommand paste" -s n -l name -d 'Clipboard 
 complete -c cb -n "__fish_cb_using_subcommand paste" -s h -l help -d 'Print help'
 complete -c cb -n "__fish_cb_using_subcommand list" -s n -l name -d 'Clipboard to use, instead of the default' -r
 complete -c cb -n "__fish_cb_using_subcommand list" -s h -l help -d 'Print help'
-complete -c cb -n "__fish_cb_using_subcommand help; and not __fish_seen_subcommand_from copy cut paste list help" -f -a "copy" -d 'Copy files into the clipboard, leaving the originals in place'
+complete -c cb -n "__fish_cb_using_subcommand help; and not __fish_seen_subcommand_from copy cut paste list help" -f -a "copy" -d 'Record files to be copied when pasted, leaving the originals in place'
 complete -c cb -n "__fish_cb_using_subcommand help; and not __fish_seen_subcommand_from copy cut paste list help" -f -a "cut" -d 'Record files to be moved when pasted. The originals stay in place until then'
 complete -c cb -n "__fish_cb_using_subcommand help; and not __fish_seen_subcommand_from copy cut paste list help" -f -a "paste" -d 'Write the clipboard\'s files into the current directory'
 complete -c cb -n "__fish_cb_using_subcommand help; and not __fish_seen_subcommand_from copy cut paste list help" -f -a "list" -d 'List what the clipboard holds'

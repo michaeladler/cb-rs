@@ -18,12 +18,25 @@ This rewrite is **significantly faster** on those shapes, and its move path fsyn
 ## Example
 
 ```sh
-cb copy notes.txt ~/images     # copy, originals stay
+cb copy notes.txt ~/images     # record the paths, originals stay
 cb list
 cb paste -d /tmp/out           # copy still in the clipboard, paste again is fine
 
 cb cut old-build/              # wipes the clipboard, records the paths
 cb paste -d /tmp/out           # moves it
+```
+
+Neither verb reads a file. Both record absolute source paths, and `paste` does
+the reading, so a recorded clipboard costs a few bytes per path no matter how
+large the tree is, and a copy that is never pasted costs nothing at all.
+
+That makes them composable. `--amend` adds to the current clipboard instead of
+replacing it, so one paste can move some entries and copy others:
+
+```sh
+cb cut old-build/              # wipes the clipboard, records the paths
+cb copy --amend notes.txt      # adds to it instead of replacing it
+cb paste -d /tmp/out           # moves old-build/, copies notes.txt
 ```
 
 Note: `--on-conflict skip|replace|ask` decides what happens when the destination already exists; the default is `skip`.
@@ -40,9 +53,10 @@ Or from a clone: `cargo build --release`.
 
 Read these before pointing `cb-rs` at anything you care about.
 
-- **A new `copy` or `cut` wipes the clipboard.** `data/` and `originals` are removed first. There is no history and no stacking, by design.
-- **`cut` records paths, not bytes.** Nothing is copied at cut time, so editing, moving, or deleting a cut file before you paste means paste moves whatever is at that path now, or fails. It is not a snapshot.
-- **Paste of copied data does not empty the clipboard.** The files stay, so a second paste copies them again. Only `cut` consumes.
+- **A new `copy` or `cut` wipes the clipboard** unless you pass `--amend`. Both lists are removed first. There is no history.
+- **`copy` records paths, not bytes.** Just like `cut`, nothing is read at copy time. Editing, moving, or deleting a copied file before you paste means paste copies whatever is at that path now, or fails. It is not a snapshot, so `cb copy f && rm f` followed by a paste will not produce `f`. Use `cp` if you want the bytes now.
+- **`cut` records paths, not bytes.** Editing, moving, or deleting a cut file before you paste means paste moves whatever is at that path now, or fails.
+- **Paste of copied paths does not empty the clipboard.** The sources stay recorded, so a second paste copies them again. Only `cut` consumes.
 - **`--on-conflict` is per top-level entry, and paste never merges.** An existing directory is not merged into; the whole entry is skipped, replaced, or, under `replace`, **emptied and renamed over** — replacing a directory deletes everything in it.
 - **`ask` needs a terminal.** With stdin not a tty it answers no, so it behaves like `skip`.
 - **A cross-filesystem move is verified by "no syscall failed, then fsync", not by comparing content.** It is far better than the original, which deleted the source after an unverified copy, but it is not a checksum.
@@ -79,18 +93,17 @@ Point `CB_TESTVOL_DIR` at the mount and `cargo test` runs against it; with no vo
 ## State
 
 `$XDG_STATE_HOME/clipboard/<name>` (falling back to `~/.local/state/clipboard`), or whatever `CLIPBOARD_PERSISTDIR` points at.
-`<name>/data` holds the files, `<name>/metadata/originals` holds the absolute sources recorded by `cut`.
+`<name>/metadata/originals` holds the absolute sources recorded by `cut`, `<name>/metadata/copies` the ones recorded by `copy`. Neither holds file data: `paste` reads the sources themselves, so a large tree costs one line per top-level entry.
 
-Copied files land directly in `<name>/data/`, one per top-level item.
-The C++ `cb` nests them under `<name>/data/<entry>/`, since it keeps a per-clipboard history of numbered entries.
-The two tools therefore do not read each other's clipboard data, even though they share the same root and `originals` file.
+`originals` is the file and format the C++ `cb` uses, so both tools read the move list the same way. `copies` is cb-rs only; the C++ `cb` stages copied bytes into `<name>/data/<entry>/` instead, since it keeps a per-clipboard history of numbered entries. For the same reason the two tools cannot read each other's clipboard contents.
 
 ## How it differs from the C++ implementation
 
 Caveats above cover the semantics; this is where the speed comes from.
 
-- **`cut` records paths only,** so cut plus paste costs one copy, not two, and a same-filesystem paste is a single `renameat2`.
-- **Copy climbs a ladder.** Reflink (`FICLONE`) first, then `copy_file_range`, then a 1 MiB buffered stream.
+- **`copy` and `cut` record paths only,** so recording is O(paths) rather than O(bytes), a copy that is never pasted costs nothing, and a cross-filesystem copy pays one transfer instead of two. A same-filesystem `cut` paste is a single `renameat2`.
+- **`--amend` does not exist upstream.** Upstream has no way to add to a clipboard, and its `cut` copies the bytes as well as recording them.
+- **Copy climbs a ladder.** Reflink (`FICLONE`) first, then `copy_file_range`, then a 1 MiB buffered stream. This now runs at paste time rather than copy time.
 - **Directory walks are work-stealing.** One crossbeam deque per thread over `openat`-relative paths, so thousands of **small files are copied in parallel**. The original `cb` walks them one at a time.
 - **Cross-filesystem moves fsync the destination before unlinking the source.** The original `cb` deletes source files after a copy it never verified.
 
@@ -99,12 +112,16 @@ Caveats above cover the semantics; this is where the speed comes from.
 `scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 on copy, cut, and paste, over three shapes: local (tmpfs → tmpfs), cross-filesystem (tmpfs → btrfs), and reflink (btrfs → btrfs).
 The `bench` workflow runs it weekly and publishes the results at <https://michaeladler.github.io/cb-rs/>.
 
-Headlines from a local run (median of five):
+Since `copy` and `cut` only record paths, recording 20 000 files or a 512 MiB file is the same handful of microseconds either way: there is no data to read. The cost lands entirely on `paste`, which walks the tree with the copy ladder and is where the numbers below come from.
 
-| op    | workload           | cb-rs        | cb           | speedup |
-|-------|--------------------|--------------|--------------|---------|
-| copy  | 20 000 small files | **52 ms**    | 309 ms       | 5.9×    |
-| paste | same tree          | **51 ms**    | 284 ms       | 5.6×    |
-| cut   | 20 000 files       | **1 ms**     | 310 ms       | 310×    |
-| paste | after that cut     | **1 ms**     | 457 ms       | 457×    |
-| copy  | 512 MiB file       | **175 ms**   | 178 ms       | 1.0×    |
+A pre-change run (median of five), kept for the cut rows, which recording paths already made free:
+
+| op    | workload           | cb-rs    | cb     | speedup |
+| ----- | ------------------ | -------- | ------ | ------- |
+| copy  | 20 000 small files | 52 ms    | 309 ms | 5.9×    |
+| paste | same tree          | 51 ms    | 284 ms | 5.6×    |
+| cut   | 20 000 files       | **1 ms** | 310 ms | 310×    |
+| paste | after that cut     | **1 ms** | 457 ms | 457×    |
+| copy  | 512 MiB file       | 175 ms   | 178 ms | 1.0×    |
+
+The `copy` rows are pre-change and no longer describe cb-rs: that work now happens in `paste`, whose `paste | same tree` row already covers it. The published page has the current figures.

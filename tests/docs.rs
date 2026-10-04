@@ -36,6 +36,10 @@ fn completions_cover_every_subcommand() {
         for sub in ["copy", "cut", "paste", "list"] {
             assert!(script.contains(sub), "{file} does not complete `{sub}`");
         }
+        assert!(
+            script.contains("amend"),
+            "{file} does not complete `--amend`"
+        );
     }
 }
 
@@ -48,6 +52,7 @@ fn man_page_documents_the_commands() {
         ".SH COMMANDS",
         ".SS cb paste",
         "on\\-conflict",
+        "\\-\\-amend",
     ] {
         assert!(
             man.contains(expected),

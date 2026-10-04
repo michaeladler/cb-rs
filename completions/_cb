@@ -34,6 +34,8 @@ _cb() {
 _arguments "${_arguments_options[@]}" : \
 '-n+[Clipboard to use, instead of the default]:NAME:_default' \
 '--name=[Clipboard to use, instead of the default]:NAME:_default' \
+'-a[add to the recorded paths instead of replacing them]' \
+'--amend[Add to the recorded paths instead of replacing them]' \
 '-h[Print help]' \
 '--help[Print help]' \
 '*::paths -- Files or directories to copy:_files' \
@@ -43,6 +45,8 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 '-n+[Clipboard to use, instead of the default]:NAME:_default' \
 '--name=[Clipboard to use, instead of the default]:NAME:_default' \
+'-a[add to the recorded paths instead of replacing them]' \
+'--amend[Add to the recorded paths instead of replacing them]' \
 '-h[Print help]' \
 '--help[Print help]' \
 '*::paths -- Files or directories to move on paste:_files' \
@@ -111,7 +115,7 @@ esac
 (( $+functions[_cb_commands] )) ||
 _cb_commands() {
     local commands; commands=(
-'copy:Copy files into the clipboard, leaving the originals in place' \
+'copy:Record files to be copied when pasted, leaving the originals in place' \
 'cut:Record files to be moved when pasted. The originals stay in place until then' \
 'paste:Write the clipboard'\''s files into the current directory' \
 'list:List what the clipboard holds' \
@@ -132,7 +136,7 @@ _cb__subcmd__cut_commands() {
 (( $+functions[_cb__subcmd__help_commands] )) ||
 _cb__subcmd__help_commands() {
     local commands; commands=(
-'copy:Copy files into the clipboard, leaving the originals in place' \
+'copy:Record files to be copied when pasted, leaving the originals in place' \
 'cut:Record files to be moved when pasted. The originals stay in place until then' \
 'paste:Write the clipboard'\''s files into the current directory' \
 'list:List what the clipboard holds' \

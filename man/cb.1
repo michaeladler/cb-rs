@@ -20,11 +20,15 @@ Print version
 
 .SH COMMANDS
 .SS cb copy
-Copy files into the clipboard, leaving the originals in place
+Record files to be copied when pasted, leaving the originals in place.
+No file is read: paste copies from the recorded path
 
 .TP
 \fB\-n\fR, \fB\-\-name\fR \fI<NAME>\fR
 Clipboard to use, instead of the default
+.TP
+\fB\-a\fR, \fB\-\-amend\fR
+Add to the recorded paths instead of replacing them
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
@@ -38,6 +42,9 @@ Record files to be moved when pasted. The originals stay in place until then
 .TP
 \fB\-n\fR, \fB\-\-name\fR \fI<NAME>\fR
 Clipboard to use, instead of the default
+.TP
+\fB\-a\fR, \fB\-\-amend\fR
+Add to the recorded paths instead of replacing them
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

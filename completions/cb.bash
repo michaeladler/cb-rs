@@ -75,7 +75,7 @@ _cb() {
             return 0
             ;;
         cb__subcmd__copy)
-            opts="-n -h --name --help"
+            opts="-n -a -h --name --amend --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -97,7 +97,7 @@ _cb() {
             return 0
             ;;
         cb__subcmd__cut)
-            opts="-n -h --name --help"
+            opts="-n -a -h --name --amend --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

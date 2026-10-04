@@ -27,7 +27,7 @@ Register-ArgumentCompleter -Native -CommandName 'cb' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('-V', '-V ', [CompletionResultType]::ParameterName, 'Print version')
             [CompletionResult]::new('--version', '--version', [CompletionResultType]::ParameterName, 'Print version')
-            [CompletionResult]::new('copy', 'copy', [CompletionResultType]::ParameterValue, 'Copy files into the clipboard, leaving the originals in place')
+            [CompletionResult]::new('copy', 'copy', [CompletionResultType]::ParameterValue, 'Record files to be copied when pasted, leaving the originals in place')
             [CompletionResult]::new('cut', 'cut', [CompletionResultType]::ParameterValue, 'Record files to be moved when pasted. The originals stay in place until then')
             [CompletionResult]::new('paste', 'paste', [CompletionResultType]::ParameterValue, 'Write the clipboard''s files into the current directory')
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List what the clipboard holds')
@@ -37,6 +37,8 @@ Register-ArgumentCompleter -Native -CommandName 'cb' -ScriptBlock {
         'cb;copy' {
             [CompletionResult]::new('-n', '-n', [CompletionResultType]::ParameterName, 'Clipboard to use, instead of the default')
             [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Clipboard to use, instead of the default')
+            [CompletionResult]::new('-a', '-a', [CompletionResultType]::ParameterName, 'Add to the recorded paths instead of replacing them')
+            [CompletionResult]::new('--amend', '--amend', [CompletionResultType]::ParameterName, 'Add to the recorded paths instead of replacing them')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
@@ -44,6 +46,8 @@ Register-ArgumentCompleter -Native -CommandName 'cb' -ScriptBlock {
         'cb;cut' {
             [CompletionResult]::new('-n', '-n', [CompletionResultType]::ParameterName, 'Clipboard to use, instead of the default')
             [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Clipboard to use, instead of the default')
+            [CompletionResult]::new('-a', '-a', [CompletionResultType]::ParameterName, 'Add to the recorded paths instead of replacing them')
+            [CompletionResult]::new('--amend', '--amend', [CompletionResultType]::ParameterName, 'Add to the recorded paths instead of replacing them')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
@@ -66,7 +70,7 @@ Register-ArgumentCompleter -Native -CommandName 'cb' -ScriptBlock {
             break
         }
         'cb;help' {
-            [CompletionResult]::new('copy', 'copy', [CompletionResultType]::ParameterValue, 'Copy files into the clipboard, leaving the originals in place')
+            [CompletionResult]::new('copy', 'copy', [CompletionResultType]::ParameterValue, 'Record files to be copied when pasted, leaving the originals in place')
             [CompletionResult]::new('cut', 'cut', [CompletionResultType]::ParameterValue, 'Record files to be moved when pasted. The originals stay in place until then')
             [CompletionResult]::new('paste', 'paste', [CompletionResultType]::ParameterValue, 'Write the clipboard''s files into the current directory')
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List what the clipboard holds')
