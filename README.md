@@ -5,15 +5,19 @@
 
 [![demo](./demo/demo.gif)](./demo/demo.gif)
 
-A faster, safer and smaller(!) Rust rewrite of [Clipboard](https://github.com/Slackadays/Clipboard) (`cb`), the cut/copy/paste tool for the command line.
+A [faster, safer and smaller](#benchmarks) Rust rewrite of [Clipboard](https://github.com/Slackadays/Clipboard) (`cb`), the cut/copy/paste tool for the command line.
 It is a drop-in for the copy/cut/paste workflow, not for `cb`'s text clipboard, history, or its other commands.
 
 ## Why a rewrite
 
-Upstream `cb` is practically unmaintained and has known bugs, some of them destructive.
-A headless `cb paste` after a `cb cut` consumes the clipboard and deletes the originals without writing anything to the destination; the overwrite prompt spins at 100% CPU on EOF.
-It is also slow on the shapes that matter: 20 000 small files, cross-filesystem moves, reflink-capable filesystems.
-This rewrite fixes the destructive paths and is [**significantly faster**](#benchmarks) on exactly those shapes.
+Upstream `cb` is practically unmaintained, and its bugs are mostly data loss:
+
+- `cb paste` ignores the directory you give it and pastes into the current one, and a paste after `cb cut` deletes the originals whether or not the copy worked. Combined, that is how a `cut` plus a headless `paste` loses both the files and the bytes. When the destination entry already exists there is no prompt either: a non-tty run replaces it silently, and the prompt that a forced-tty run does reach (`CLIPBOARD_FORCETTY=1`) spins at 100% CPU on EOF instead of reading a line.
+- Nothing is ever verified. `cb` has no move at all: `cut` copies the bytes into the clipboard, `paste` copies them back out, and then the originals are deleted. No rename, no fsync, no size or checksum check. `cb-rs` at least fsyncs the destination before unlinking ([why that is still not enough](#caveats)).
+- Upstream keeps a history of clipboard entries, but `cb clear`, and history trimming under a byte, age or count limit, delete them outright. Under a shared state root those deletions take the other tool's staged bytes with them. `cb-rs` records paths, stages nothing, and keeps its lists in a [directory of its own](#state).
+
+It is also slow on the workloads that matter: 20 000 small files, cross-filesystem moves, reflink-capable filesystems.
+This rewrite fixes the destructive paths and is [**significantly faster**](#benchmarks) on exactly those workloads.
 
 ## Benchmarks
 
@@ -79,7 +83,7 @@ Read these before pointing `cb-rs` at anything you care about.
 - `copy` and `cut` record paths, not bytes, and nothing is read at record time. Editing, moving, or deleting a source before you paste means paste acts on whatever is at that path now, or fails. It is not a snapshot, so `cb copy f && rm f` followed by a paste will not produce `f`. Use `cp` if you want the bytes now.
 - Paste of copied paths does not empty the clipboard. The sources stay recorded, so a second paste copies them again. Only `cut` consumes.
 - `ask` needs a terminal. With stdin not a tty it answers no, so it behaves like `skip`.
-- A cross-filesystem move is verified by "no syscall failed, then fsync", not by comparing content. It is far better than the original, which deleted the source after an unverified copy, but it is not a checksum.
+- A cross-filesystem move is verified by "no syscall failed, then fsync", not by comparing content. The original copied into its clipboard, copied back out, and deleted the originals with nothing checked at any step, but this is still not a checksum.
 - Only permission bits are preserved. Hardlinks, ownership, timestamps, xattrs, ACLs, and sparse holes are not.
 - Symlinks are recreated, never followed. A tree whose links point outside itself pastes links that may dangle until the destination has them too.
 - Failures are per entry and do not abort the run. The count is printed and the exit status is 1, but the remaining items still move.
@@ -109,14 +113,14 @@ Caveats above cover the semantics; this is where the speed comes from.
 - `--amend` does not exist upstream. Upstream has no way to add to a clipboard, and its `cut` copies the bytes as well as recording them.
 - Copy climbs a ladder: reflink (`FICLONE`) first, then `copy_file_range`, then a 1 MiB buffered stream. This now runs at paste time rather than copy time.
 - Directory walks are work-stealing: one crossbeam deque per thread over `openat`-relative paths, so thousands of small files are copied in parallel. The original `cb` walks them one at a time.
-- Cross-filesystem moves fsync the destination before unlinking the source. The original `cb` deletes source files after a copy it never verified.
+- Cross-filesystem moves fsync the destination before unlinking the source. The original `cb` has no move path: it copies into the clipboard, copies back out, and deletes the sources without verifying either copy.
 
 ## State
 
 `$XDG_STATE_HOME/cb-rs/<name>` (falling back to `~/.local/state/cb-rs`), or whatever `CLIPBOARD_PERSISTDIR` points at. `<name>` is `0` unless you pass `-n`/`--name`.
 `<name>/metadata/originals` holds the absolute sources recorded by `cut`, `<name>/metadata/copies` the ones recorded by `copy`. Neither holds file data: `paste` reads the sources themselves, so a large tree costs one line per top-level entry.
 
-This is deliberately a different directory from the C++ `cb`'s `$XDG_STATE_HOME/clipboard`. The two tools cannot read each other's clipboards, and sharing the directory would have been worse than useless: a new `cut` wipes the whole clipboard entry, which under the shared root deleted the other tool's staged bytes. `cb-rs` stages nothing, so it keeps two small lists and nothing else.
+This is deliberately a different directory from the C++ `cb`'s `$XDG_STATE_HOME/clipboard`. The two tools cannot read each other's clipboards, and sharing the directory would have been worse than useless: every upstream entry holds real bytes, and `cb clear` or a history trim under a byte, age or count limit deletes an entry outright, which under the shared root took the other tool's staged data with it. `cb-rs` stages nothing, so it keeps two small lists and nothing else.
 
 Upgrading from a `cb-rs` that shared the C++ `cb` root leaves that old clipboard where it is. Delete `~/.local/state/clipboard` by hand once you are sure you have nothing pending in the C++ `cb`; `cb-rs` no longer reads or writes it.
 
