@@ -289,6 +289,15 @@ fn record(
 }
 
 fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(), String> {
+    // Checked once here: a missing destination otherwise surfaces as one
+    // "No such file or directory" per source, naming the source, which is where
+    // the user is not looking.
+    if !dst_dir.is_dir() {
+        return Err(format!(
+            "{}: destination is not an existing directory",
+            dst_dir.display()
+        ));
+    }
     let moves = clipboard.read_list(&clipboard.originals());
     let copies = clipboard.read_list(&clipboard.copies());
     let mut result = Ok(());

@@ -316,6 +316,57 @@ fn a_copy_is_not_consumed_by_pasting() {
     );
 }
 
+/// The default state layout is this tool's own contract with anyone scripting
+/// against it, and it moved off the C++ `cb`'s directory so a cut here cannot
+/// wipe the other tool's staged bytes. `CLIPBOARD_PERSISTDIR` replaces the root
+/// wholesale, as it always has, so only the default path carries `cb-rs/`.
+#[test]
+fn default_state_lives_under_its_own_directory() {
+    let sandbox = Sandbox::new("state");
+    let out = Command::new(env!("CARGO_BIN_EXE_cb"))
+        .args(["copy", "kept"])
+        .env_remove("CLIPBOARD_PERSISTDIR")
+        .env("XDG_STATE_HOME", sandbox.root.join("state"))
+        .current_dir(sandbox.root.join("work"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+
+    let state = sandbox.root.join("state");
+    assert!(
+        state.join("cb-rs/0/metadata/copies").exists(),
+        "expected the clipboard under state/cb-rs, found: {:?}",
+        std::fs::read_dir(&state).map(|d| {
+            d.filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        })
+    );
+    assert!(
+        !state.join("clipboard").exists(),
+        "the C++ cb's directory must not be used"
+    );
+}
+
+/// A missing destination is reported once, naming the destination. Left to the
+/// per-entry path it produced one "No such file or directory" per source, which
+/// blames the source and sends the user looking in the wrong place.
+#[test]
+fn paste_names_a_missing_destination_once() {
+    let sandbox = Sandbox::new("nodest");
+    sandbox.ok(&["copy", "kept", "moved.txt"]);
+
+    let out = sandbox.run(&["paste", "-d", "../nowhere"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert_eq!(
+        err.matches("No such file or directory").count(),
+        0,
+        "the error must not be reported per source: {err}"
+    );
+    assert!(err.contains("nowhere"), "{err}");
+}
+
 /// Paths are stored absolute, because paste runs in a directory the user never
 /// named. A relative path recorded from `work` would not resolve from `out`.
 #[test]
