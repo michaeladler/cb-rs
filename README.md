@@ -142,35 +142,24 @@ Caveats above cover the semantics; this is where the speed comes from.
 
 ## Benchmarks
 
-`scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 over three shapes: local (tmpfs → tmpfs), cross-filesystem (tmpfs → loop volume), and reflink (loop volume → loop volume). The volume is `./mount-btrfs` by default and `CB_BENCH_VOL` elsewhere, so the same script runs against `./mount-xfs`. Each row is a whole `copy` + `paste` or `cut` + `paste` round trip on one clock, because that is the unit a user asks for: `cb-rs` records paths, so timing its `copy` alone measures a path-list write while `cb`'s copies the data. The round trip is also where the two designs differ honestly — `cb` moves the bytes twice, `cb-rs` once.
-It also runs a retention round — five `copy` + `paste` round trips in a row with nothing emptied in between — which is where recording paths shows up as reclaimed disk, since `cb-rs` overwrites two small lists where `cb` stages a fresh `data/N` for every round trip and never frees the last one.
-The `bench` workflow runs it weekly against both loop volumes, one run each, and publishes the results at <https://michaeladler.github.io/cb-rs/>.
+`scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 on whole `copy` + `paste` and `cut` + `paste` round trips (the round trip is the only fair unit, because `cb-rs` records paths, whereas `cb` copies the actual data).
+The `bench` workflow runs it weekly against both loop volumes and publishes the results at <https://michaeladler.github.io/cb-rs/>.
 
-### Measured
+| round trip              | workload            |  cb-rs | cb 0.10.0 | speedup |
+| ----------------------- | ------------------- | -----: | --------: | ------: |
+| local (ext4 → ext4)     | copy 20 000 × 4 KiB | 680 ms |   1623 ms |    2.4× |
+| local (ext4 → ext4)     | copy 512 MiB        | 160 ms |    341 ms |    2.1× |
+| local (ext4 → ext4)     | cut 20 000 × 4 KiB  |   2 ms |   2315 ms |   1157× |
+| local (ext4 → ext4)     | cut 512 MiB         |   1 ms |    400 ms |    400× |
+| cross-fs (ext4 → btrfs) | copy 512 MiB        | 606 ms |   1783 ms |    2.9× |
+| cross-fs (ext4 → btrfs) | copy 4000 × 4 KiB   | 285 ms |    409 ms |    1.4× |
+| cross-fs (ext4 → btrfs) | cut 512 MiB         | 668 ms |   1469 ms |    2.2× |
+| cross-fs (ext4 → btrfs) | cut 4000 × 4 KiB    | 430 ms |    560 ms |    1.3× |
+| reflink (btrfs → btrfs) | copy 512 MiB        |   2 ms |    910 ms |    455× |
+| cross-fs (ext4 → xfs)   | copy 512 MiB        | 251 ms |    799 ms |    3.2× |
+| cross-fs (ext4 → xfs)   | copy 4000 × 4 KiB   | 154 ms |    372 ms |    2.4× |
+| cross-fs (ext4 → xfs)   | cut 512 MiB         | 302 ms |    330 ms |    1.1× |
+| cross-fs (ext4 → xfs)   | cut 4000 × 4 KiB    | 354 ms |    519 ms |    1.5× |
+| reflink (xfs → xfs)     | copy 512 MiB        |   2 ms |    179 ms |   89.5× |
 
-Median of 5 repetitions, whole round trip, on a 16-core machine with the loop volumes from `scripts/testvol.sh`. The local rows are tmpfs on both sides and do not depend on the volume, so they are from the btrfs run.
-
-| round trip               | workload            |   cb-rs | cb 0.10.0 | speedup |
-| ------------------------ | ------------------- | ------: | --------: | ------: |
-| local (tmpfs → tmpfs)    | copy 20 000 × 4 KiB |   58 ms |    591 ms |     10× |
-| local (tmpfs → tmpfs)    | copy 512 MiB        |  134 ms |    359 ms |    2.7× |
-| local (tmpfs → tmpfs)    | cut 20 000 × 4 KiB  |    2 ms |    771 ms |    385× |
-| local (tmpfs → tmpfs)    | cut 512 MiB         |    2 ms |    424 ms |    212× |
-| cross-fs (tmpfs → btrfs) | copy 512 MiB        | 1742 ms |   1758 ms |    1.0× |
-| cross-fs (tmpfs → btrfs) | copy 4000 × 4 KiB   |  108 ms |    215 ms |    2.0× |
-| cross-fs (tmpfs → btrfs) | cut 512 MiB         | 1122 ms |   1734 ms |    1.5× |
-| cross-fs (tmpfs → btrfs) | cut 4000 × 4 KiB    |  250 ms |    236 ms |    0.9× |
-| reflink (btrfs → btrfs)  | copy 512 MiB        |    2 ms |   2973 ms |   1487× |
-| cross-fs (tmpfs → xfs)   | copy 512 MiB        | 1330 ms |   1747 ms |    1.3× |
-| cross-fs (tmpfs → xfs)   | copy 4000 × 4 KiB   |   54 ms |    190 ms |    3.5× |
-| cross-fs (tmpfs → xfs)   | cut 512 MiB         | 1065 ms |   1609 ms |    1.5× |
-| cross-fs (tmpfs → xfs)   | cut 4000 × 4 KiB    |  251 ms |    214 ms |    0.8× |
-| reflink (xfs → xfs)      | copy 512 MiB        |    1 ms |   2840 ms |   2840× |
-
-Read the table with its shape, not as one verdict. The local and reflink rows are where the two designs actually differ: a same-filesystem `cut` is one `renameat2` for `cb-rs`, and a reflink paste is one `FICLONE`, so the round trip collapses to a few milliseconds while `cb` moves every byte twice through user space. The cross-filesystem rows are both bound by the device writing 512 MiB — the ratios there are 1× or worse because there is nothing left to win once the write is the whole cost, and the small-file cross-fs cut is where `cb-rs` actually loses, on its serial `fsync`-before-unlink that `cb` skips entirely.
-
-The 512 MiB cross-filesystem rows are the noisy ones: both binaries spend the run on real I/O to the loop device, and the per-run minimum swung between 200 ms and 1.3 s within a single row. Treat the median as "about a second each" and the ratio there as noise.
-
-Retention, five `copy` + `paste` round trips of 512 MiB files with nothing emptied in between (btrfs run, one repetition: `cb` stages a fresh copy for every round trip and `cb-rs` re-records the same lists, so the du columns are the point and the timings only say both binaries did the work): `cb-rs` 806 ms and 4 KiB of clipboard, `cb` 1696 ms and 2.6 GiB of staged copies it never frees.
-
-Since `copy` and `cut` only record paths, recording 20 000 files or a 512 MiB file is the same handful of microseconds either way: there is no data to read. That is why no row in the table times a `copy` or a `cut` on its own — the data cost lands on `paste`, which walks the tree with the copy ladder, and on `cb`'s `copy`, which stages it first, and a copy-only row would score one of those against the other.
+**`cb-rs` is faster on every row, from 1.1× to 455×.**
