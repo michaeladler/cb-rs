@@ -259,6 +259,25 @@ fn amend_accumulates_a_move_and_a_copy_into_one_paste() {
     );
 }
 
+/// "more" is only true when there was something to add to, so amending an
+/// empty clipboard does not claim it added to one.
+#[test]
+fn amend_reports_more_only_when_the_clipboard_had_entries() {
+    let sandbox = Sandbox::new("amend-more");
+
+    let first = sandbox.ok(&["copy", "--amend", "kept"]);
+    assert_eq!(
+        String::from_utf8_lossy(&first.stdout).trim(),
+        "copy 1 item(s), will copy on paste"
+    );
+
+    let second = sandbox.ok(&["copy", "--amend", "moved.txt"]);
+    assert_eq!(
+        String::from_utf8_lossy(&second.stdout).trim(),
+        "copy 2 more item(s), will copy on paste"
+    );
+}
+
 /// Without `--amend` a copy replaces the whole clipboard, pending move included.
 /// This is the documented wipe, and it is the reason `--amend` exists.
 #[test]

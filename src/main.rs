@@ -263,6 +263,8 @@ fn record(
         clipboard.reset().map_err(|e| e.to_string())?;
         Vec::new()
     };
+    // "more" only when there was something to add to.
+    let added_to_existing = amend && !list.is_empty();
     let recorded = list.len() + sources.len();
     list.append(&mut sources);
     clipboard
@@ -272,12 +274,12 @@ fn record(
     for error in &errors {
         eprintln!("cb: {error}");
     }
-    let more = if amend { " more" } else { "" };
     let failed = if errors.is_empty() {
         String::new()
     } else {
         format!(", {} failed", errors.len())
     };
+    let more = if added_to_existing { " more" } else { "" };
     println!("{verb} {recorded}{more} item(s), will {future} on paste{failed}");
     if errors.is_empty() {
         Ok(())
