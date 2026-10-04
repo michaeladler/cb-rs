@@ -39,7 +39,28 @@ cb copy --amend notes.txt      # adds to it instead of replacing it
 cb paste -d /tmp/out           # moves old-build/, copies notes.txt
 ```
 
-Note: `--on-conflict skip|replace|ask` decides what happens when the destination already exists; the default is `skip`.
+`paste` writes into an existing directory; it does not create one. Note:
+`--on-conflict skip|replace|ask` decides what happens when the destination
+already exists; the default is `skip`.
+
+## Clipboards
+
+Every verb takes `-n`/`--name <NAME>` to pick a clipboard other than the
+default `0`. The flag is global: `cb -n work list` and `cb list -n work` are the
+same command.
+
+`list` prints one tab-separated line per recorded path, `cut` or `copy` followed
+by the absolute source:
+
+```
+cut	/home/me/old-build
+copy	/home/me/notes.txt
+```
+
+Exit codes are the ones `cb` has always used: `2` for a usage error, with the
+message on stderr, and `1` for a runtime failure, with the details on stderr and
+a count on stdout. A failed path never aborts the run — `copy` records the paths
+that resolved, exits 1, and reports how many did not.
 
 ## Install
 
@@ -54,6 +75,7 @@ Or from a clone: `cargo build --release`.
 Read these before pointing `cb-rs` at anything you care about.
 
 - **A new `copy` or `cut` wipes the clipboard** unless you pass `--amend`. Both lists are removed first. There is no history.
+- **`paste` needs an existing destination.** `-d` is never created for you.
 - **`copy` records paths, not bytes.** Just like `cut`, nothing is read at copy time. Editing, moving, or deleting a copied file before you paste means paste copies whatever is at that path now, or fails. It is not a snapshot, so `cb copy f && rm f` followed by a paste will not produce `f`. Use `cp` if you want the bytes now.
 - **`cut` records paths, not bytes.** Editing, moving, or deleting a cut file before you paste means paste moves whatever is at that path now, or fails.
 - **Paste of copied paths does not empty the clipboard.** The sources stay recorded, so a second paste copies them again. Only `cut` consumes.
@@ -64,7 +86,7 @@ Read these before pointing `cb-rs` at anything you care about.
 - **Symlinks are recreated, never followed.** A tree whose links point outside itself pastes links that may dangle until the destination has them too.
 - **Failures are per entry and do not abort the run.** The count is printed and the exit status is 1, but the remaining items still move.
 - **macOS loses fifos and device nodes.** There is no `mknodat` there, so those entries fail; and only the streaming rung of the copy ladder is compiled in, so big-file copies there are at `cb` parity, not better.
-- **Clipboard data is not shared with the C++ `cb`**, even though the root directory is. See [State](#state).
+- **The clipboard is not shared with the C++ `cb`.** Not the contents and not the directory. See [State](#state).
 
 ## Man page and shell completions
 
@@ -92,10 +114,21 @@ Point `CB_TESTVOL_DIR` at the mount and `cargo test` runs against it; with no vo
 
 ## State
 
-`$XDG_STATE_HOME/clipboard/<name>` (falling back to `~/.local/state/clipboard`), or whatever `CLIPBOARD_PERSISTDIR` points at.
+`$XDG_STATE_HOME/cb-rs/<name>` (falling back to `~/.local/state/cb-rs`), or
+whatever `CLIPBOARD_PERSISTDIR` points at. `<name>` is `0` unless you pass
+`-n`/`--name`.
 `<name>/metadata/originals` holds the absolute sources recorded by `cut`, `<name>/metadata/copies` the ones recorded by `copy`. Neither holds file data: `paste` reads the sources themselves, so a large tree costs one line per top-level entry.
 
-`originals` is the file and format the C++ `cb` uses, so both tools read the move list the same way. `copies` is cb-rs only; the C++ `cb` stages copied bytes into `<name>/data/<entry>/` instead, since it keeps a per-clipboard history of numbered entries. For the same reason the two tools cannot read each other's clipboard contents.
+This is deliberately a different directory from the C++ `cb`'s
+`$XDG_STATE_HOME/clipboard`. The two tools cannot read each other's clipboards,
+and sharing the directory would have been worse than useless: a new `cut` wipes
+the whole clipboard entry, which under the shared root deleted the other tool's
+staged bytes. `cb-rs` stages nothing, so it keeps two small lists and nothing
+else.
+
+Upgrading from a `cb-rs` that shared the C++ `cb` root leaves that old clipboard
+where it is. Delete `~/.local/state/clipboard` by hand once you are sure you
+have nothing pending in the C++ `cb`; `cb-rs` no longer reads or writes it.
 
 ## How it differs from the C++ implementation
 
@@ -109,7 +142,7 @@ Caveats above cover the semantics; this is where the speed comes from.
 
 ## Benchmarks
 
-`scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 on copy, cut, and paste, over three shapes: local (tmpfs → tmpfs), cross-filesystem (tmpfs → btrfs), and reflink (btrfs → btrfs).
+`scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 on copy, cut, and paste, over three shapes: local (tmpfs → tmpfs), cross-filesystem (tmpfs → btrfs), and reflink (btrfs → btrfs). It also runs a retention round — five copies in a row with nothing emptied in between — which is where recording paths shows up as reclaimed disk, since `cb-rs` overwrites two small lists where `cb` stages a fresh `data/N` every time and never frees the last one.
 The `bench` workflow runs it weekly and publishes the results at <https://michaeladler.github.io/cb-rs/>.
 
 Since `copy` and `cut` only record paths, recording 20 000 files or a 512 MiB file is the same handful of microseconds either way: there is no data to read. The cost lands entirely on `paste`, which walks the tree with the copy ladder and is where the numbers below come from.
