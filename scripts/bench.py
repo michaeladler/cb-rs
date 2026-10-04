@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Compare cb-rs against cb 0.10.0 on copy / cut / paste.
+"""Compare cb-rs against cb 0.10.0 on a copy+paste and a cut+paste round trip.
+
+Copy and paste are timed as one operation, not two rows. cb-rs records the
+source paths, so its copy alone reads a few bytes of state, while cb stages the
+whole tree: the copy rows would compare a path-list write against a data copy.
+The round trip is the work a user actually asks for, and both binaries are
+built around it.
 
 Two filesystems are in play: WORK is tmpfs (RAM), ./mount-btrfs is the btrfs loop
 volume. Each clipboard staging directory is placed next to the data it moves,
@@ -26,7 +32,9 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(os.environ["HOME"], "bench")
-BTRFS_WORK = os.path.join(ROOT, "mount-btrfs/bench")
+VOL = os.path.join(ROOT, "mount-btrfs")
+BTRFS_WORK = os.path.join(VOL, "bench")
+VOL_FS = "?"  # resolved in main(), once VOL exists: findmnt needs the path
 BIG = 512 << 20
 SMALL_LOCAL = 20000
 SMALL_CROSS = 4000
@@ -102,6 +110,14 @@ def du(path):
     return out.stdout.split()[0] if out.stdout.strip() else "-"
 
 
+def fs_of(path):
+    """Filesystem backing path. The banners name what the run is actually on,
+    so a machine without the btrfs volume says so rather than claiming CoW."""
+    out = subprocess.run(["findmnt", "-n", "-o", "FSTYPE", "-T", path],
+                         capture_output=True, text=True)
+    return out.stdout.strip() or "?"
+
+
 # cb paste silently does nothing without a terminal, so every cb paste runs
 # under a pty. The pty also has to answer cb's overwrite prompt: on EOF it spins
 # forever at 100% CPU. cb copy/cut work headless and are timed directly.
@@ -136,16 +152,22 @@ IMPLS = (RS, CB)
 
 # -------------------------------------------------------------------- timing
 
-def timed(cmd, reset=None):
-    """Median, minimum, and return code of cmd. reset runs untimed before each
-    repetition; it may be a list of callables."""
+def timed(cmds, reset=None):
+    """Median, minimum, and return code of cmds run back to back on one clock.
+
+    cmds is always a list, even for a single command: one argv is itself a list
+    of strings, so a bare list would be ambiguous. reset runs untimed before
+    each repetition; it may be a list of callables.
+    """
     reset = reset or []
     times, rc = [], 0
     for _ in range(REPS):
         for step in reset:
             step()
         start = time.perf_counter_ns()
-        rc = run(cmd)
+        for cmd in cmds:
+            cmd_rc = run(cmd)
+            rc = rc or cmd_rc  # first failure wins, not the last one to hide it
         times.append((time.perf_counter_ns() - start) // 1_000_000)
     return statistics.median(times), min(times), rc
 
@@ -153,7 +175,7 @@ def timed(cmd, reset=None):
 def row(op, workload, impl, med, low, rc, note=""):
     """rc is only worth a column when it is not 0: a failing copy is otherwise
     indistinguishable from a fast one."""
-    print("%-5s %-13s %7.0f ms   min %6d   %s"
+    print("%-11s %-13s %7.0f ms   min %6d   %s"
           % (op, workload + " " + impl, med, low,
              note if rc == 0 else "rc %d" % rc))
 
@@ -195,22 +217,26 @@ def empty_clip(impl):
 # ============================================================ copy + paste
 
 def sweep(src, dr, dc, workload, expect, check_copy=False):
-    """Copy then paste one workload, both binaries, same order as the table."""
+    """Copy then paste one workload on both binaries, timed as one round trip.
+
+    The clipboard and the destination both start empty on every repetition: an
+    entry left behind by the previous run is part of what the next one costs.
+    """
     name = os.path.basename(src)
     for impl in IMPLS:
-        med, low, rc = timed(impl.copy(src), [empty_clip(impl)])
-        note = recorded(impl, src) if check_copy and impl is RS else ""
-        row("copy", workload, impl.name, med, low, rc, note)
-
-    for impl in IMPLS:
         dest = dr if impl is RS else dc
-        med, low, rc = timed(impl.paste(dest), [lambda: rm_rf(os.path.join(dest, name))])
-        row("paste", workload, impl.name, med, low, rc, landed(os.path.join(dest, name), expect))
+        step = os.path.join(dest, name)
+        med, low, rc = timed([impl.copy(src), impl.paste(dest)],
+                             [empty_clip(impl), lambda: rm_rf(step)])
+        note = landed(step, expect)
+        if check_copy and impl is RS:
+            note = recorded(impl, src) + ", " + note
+        row("copy+paste", workload, impl.name, med, low, rc, note)
 
 
 def cut_bench(name, dr, dc):
-    """cut, then paste of the cut. cut consumes the source, so every repetition
-    needs a fresh copy of it."""
+    """cut, then paste of the cut, on one clock. cut consumes the source, so
+    every repetition needs a fresh copy of it."""
     src = os.path.join(WORK, "src", name)
     cutsrc = os.path.join(WORK, "cutsrc", name)
     for d in (os.path.dirname(cutsrc), dr, dc):
@@ -228,15 +254,9 @@ def cut_bench(name, dr, dc):
             subprocess.run(["cp", "-a", src, cutsrc])
             rm_rf(impl.clip)
 
-        med, low, rc = timed(impl.cut(cutsrc), [fresh])
-        row("cut", name, impl.name, med, low, rc)
-
-        # The cut is untimed setup here: it happens inside reset, so only the
-        # paste is on the clock.
-        cut = impl.cut(cutsrc)
-        med, low, rc = timed(impl.paste(dest), [fresh, lambda: run(cut)])
+        med, low, rc = timed([impl.cut(cutsrc), impl.paste(dest)], [fresh])
         note = landed(step, 1 if name in ("big", "x") else count_of(src))
-        row("paste", name, impl.name, med, low, rc, note)
+        row("cut+paste", name, impl.name, med, low, rc, note)
 
 
 # ===================================================================== main
@@ -249,6 +269,8 @@ def main():
     sys.stdout.reconfigure(line_buffering=True)
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(BTRFS_WORK, exist_ok=True)
+    global VOL_FS
+    VOL_FS = fs_of(VOL)
     for impl in IMPLS:
         impl.use_clip(os.path.join(WORK, "rsstate" if impl is RS else "cbclip"))
 
@@ -272,23 +294,23 @@ def main():
     for d in (d_r, d_c, os.path.join(WORK, "cutsrc")):
         rm_rf(d)
 
-    banner("cross-fs: tmpfs -> btrfs")
+    banner("cross-fs: tmpfs -> %s" % VOL_FS)
     dr, dc = os.path.join(BTRFS_WORK, "d_r"), os.path.join(BTRFS_WORK, "d_c")
     rm_rf(src)
     for d in (src, dr, dc):
         os.makedirs(d, exist_ok=True)
     mk_big(os.path.join(src, "x"), "big.img", BIG)
     mk_small(os.path.join(src, "y"), SMALL_CROSS, 4 * 1024)
-    # The copy rows below are tmpfs to tmpfs: both clipboards are on $WORK, so
-    # "cross-fs" describes the paste, not the copy.
+    # Both clipboards sit on $WORK (tmpfs) here, so the copy half of the round
+    # trip is tmpfs to tmpfs for both binaries; "cross-fs" describes the paste.
     sweep(os.path.join(src, "x"), dr, dc, "%dM" % (BIG >> 20), 1)
     sweep(os.path.join(src, "y"), dr, dc, "4k x%d" % SMALL_CROSS, SMALL_CROSS)
 
-    banner("cross-fs cut+paste: tmpfs -> btrfs")
+    banner("cross-fs cut+paste: tmpfs -> %s" % VOL_FS)
     cut_bench("x", dr, dc)
     cut_bench("y", dr, dc)
 
-    banner("reflink: btrfs -> btrfs")
+    banner("reflink: %s -> %s" % (VOL_FS, VOL_FS))
     bsrc = os.path.join(BTRFS_WORK, "src")
     for d in (bsrc, dr, dc):
         rm_rf(d)
@@ -296,26 +318,32 @@ def main():
     for impl in IMPLS:
         impl.use_clip(os.path.join(BTRFS_WORK, "rsstate" if impl is RS else "cbclip"))
     mk_big(bsrc, "big.img", BIG)
-    sweep(bsrc, dr, dc, "%dM" % (BIG >> 20), 1)
+    # A reflink row on a filesystem without FICLONE is a copy row wearing the
+    # wrong name, so the shape is skipped rather than renamed.
+    if VOL_FS not in ("btrfs", "xfs", "zfs"):
+        print("skipped: %s has no FICLONE, so this would be a plain copy"
+              % VOL_FS)
+    else:
+        sweep(bsrc, dr, dc, "%dM" % (BIG >> 20), 1)
 
     banner("retention: 5 copies in a row, nothing emptied in between")
-    # The copy rows above empty the clipboard first, which is the only way to
-    # time a copy. This is the other half of the trade: cb-rs' reset is timed
-    # out of the picture there and cb's missing one is what the old numbers
-    # were reading.
+    # Round trips above empty the clipboard first, so the entry a copy leaves
+    # behind never lands on the clock. This is the other half of the trade: it
+    # costs cb-rs nothing and costs cb a staged copy that is never freed, which
+    # the du columns read.
     for impl in IMPLS:
         impl.use_clip(os.path.join(WORK, "rsstate" if impl is RS else "cbclip"))
     ret = os.path.join(WORK, "ret")
     mk_big(ret, "big.img", BIG)
     for impl in IMPLS:
-        med, low, _ = timed(impl.copy(ret))
+        med, low, _ = timed([impl.copy(ret)])
         print("copy x5 %-6s %4d ms   min %4d ms   clipboard now holds cb-rs %-6s cb %-6s"
               % (impl.name, med, low, du(RS.clip), du(CB.clip)))
         rm_rf(impl.clip)
     rm_rf(ret)
 
     banner("space")
-    subprocess.run(["df", "-h", WORK, os.path.join(ROOT, "mount-btrfs")])
+    subprocess.run(["df", "-h", WORK, VOL])
 
 
 if __name__ == "__main__":

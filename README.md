@@ -142,19 +142,8 @@ Caveats above cover the semantics; this is where the speed comes from.
 
 ## Benchmarks
 
-`scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 on copy, cut, and paste, over three shapes: local (tmpfs → tmpfs), cross-filesystem (tmpfs → btrfs), and reflink (btrfs → btrfs). It also runs a retention round — five copies in a row with nothing emptied in between — which is where recording paths shows up as reclaimed disk, since `cb-rs` overwrites two small lists where `cb` stages a fresh `data/N` every time and never frees the last one.
+`scripts/bench.py [reps]` compares `cb-rs` against `cb` 0.10.0 over three shapes: local (tmpfs → tmpfs), cross-filesystem (tmpfs → btrfs), and reflink (btrfs → btrfs). Each row is a whole `copy` + `paste` or `cut` + `paste` round trip on one clock, because that is the unit a user asks for: `cb-rs` records paths, so timing its `copy` alone measures a path-list write while `cb`'s copies the data. The round trip is also where the two designs differ honestly — `cb` moves the bytes twice, `cb-rs` once.
+It also runs a retention round — five copies in a row with nothing emptied in between — which is where recording paths shows up as reclaimed disk, since `cb-rs` overwrites two small lists where `cb` stages a fresh `data/N` every time and never frees the last one.
 The `bench` workflow runs it weekly and publishes the results at <https://michaeladler.github.io/cb-rs/>.
 
-Since `copy` and `cut` only record paths, recording 20 000 files or a 512 MiB file is the same handful of microseconds either way: there is no data to read. The cost lands entirely on `paste`, which walks the tree with the copy ladder and is where the numbers below come from.
-
-A pre-change run (median of five), kept for the cut rows, which recording paths already made free:
-
-| op    | workload           | cb-rs    | cb     | speedup |
-| ----- | ------------------ | -------- | ------ | ------- |
-| copy  | 20 000 small files | 52 ms    | 309 ms | 5.9×    |
-| paste | same tree          | 51 ms    | 284 ms | 5.6×    |
-| cut   | 20 000 files       | **1 ms** | 310 ms | 310×    |
-| paste | after that cut     | **1 ms** | 457 ms | 457×    |
-| copy  | 512 MiB file       | 175 ms   | 178 ms | 1.0×    |
-
-The `copy` rows are pre-change and no longer describe cb-rs: that work now happens in `paste`, whose `paste | same tree` row already covers it. The published page has the current figures.
+Since `copy` and `cut` only record paths, recording 20 000 files or a 512 MiB file is the same handful of microseconds either way: there is no data to read. The data cost lands entirely on `paste`, which walks the tree with the copy ladder — and on `cb`'s `copy`, which stages it first.

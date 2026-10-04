@@ -8,15 +8,11 @@ tmpfs           8.0G  606M  7.5G   8% /home/runner/bench
 
 == local: tmpfs -> tmpfs
 fixture: 20000 small files, 512 MiB single file
-copy  small cb-rs       318 ms   min    318   20000 files
-copy  small cb          479 ms   min    479
-paste small cb-rs       316 ms   min    316   20000 files
-paste small cb          479 ms   min    479   20000 files
+copy+paste small cb-rs     634 ms   min    634   recorded, 20000 files
+copy+paste small cb        958 ms   min    958   20000 files
 --- cut+paste small -> /home/runner/bench/cut_r
-cut   small cb-rs         1 ms   min      1
-paste small cb-rs         0 ms   min      0   20000 files
-cut   small cb          475 ms   min    475
-paste small cb          700 ms   min    700   20000 files
+cut+paste small cb-rs        1 ms   min      1   20000 files
+cut+paste small cb         1175 ms   min   1175   20000 files
 
 == retention: 5 copies in a row
 copy x5 cb-rs   558 ms   min  558 ms   clipboard now holds cb-rs 512M   cb 4.0K
@@ -29,8 +25,8 @@ copy x5 cb     1069 ms   min 1069 ms   clipboard now holds cb-rs 0      cb 513M
 class Test(unittest.TestCase):
     def test_row(self):
         self.assertEqual(
-            benchhtml.row("copy  small cb-rs       318 ms   min    318   20000 files"),
-            ("copy", "small", "cb-rs", 318, 318, "20000 files"))
+            benchhtml.row("copy+paste small cb-rs     634 ms   min    634   recorded"),
+            ("copy+paste", "small", "cb-rs", 634, 634, "recorded"))
         # retention rows carry a "ms" after the minimum
         self.assertEqual(
             benchhtml.row("copy x5 cb     1069 ms   min 1069 ms   clipboard now holds cb 0"),
@@ -43,27 +39,27 @@ class Test(unittest.TestCase):
     def test_pairs(self):
         entries = benchhtml.pairs(LOG.splitlines())
         got = {(e.op, e.workload): e.got for e in entries}
-        self.assertEqual(got[("copy", "small")], {"cb-rs": (318, 318), "cb": (479, 479)})
+        self.assertEqual(got[("copy+paste", "small")],
+                         {"cb-rs": (634, 634), "cb": (958, 958)})
         self.assertEqual(got[("copy", "x5")], {"cb-rs": (558, 558), "cb": (1069, 1069)})
-        # cut rows interleave, they still pair up
-        self.assertEqual(got[("cut", "small")], {"cb-rs": (1, 1), "cb": (475, 475)})
-        self.assertEqual(got[("paste", "small")],
-                         {"cb-rs": (0, 0), "cb": (700, 700)})
+        # cut+paste rows interleave with the copy+paste table above them, they
+        # still pair up on their own op
+        self.assertEqual(got[("cut+paste", "small")],
+                         {"cb-rs": (1, 1), "cb": (1175, 1175)})
         # every row appears, nothing silently dropped
-        self.assertEqual(len(entries), 5)
+        self.assertEqual(len(entries), 3)
 
     def test_render(self):
         out = benchhtml.render(LOG)
         self.assertIn("<h2>local: tmpfs -&gt; tmpfs</h2>", out)
         self.assertIn("<h2>space</h2>", out)
-        self.assertIn("<td>1.5&times;</td>", out)   # 479/318
+        self.assertIn("<td>1.5&times;</td>", out)   # 958/634
         self.assertIn('class="win"', out)
-        # both impls get a cell, and the shared file count is not doubled
-        self.assertRegex(out, re.escape('<b>318 ms</b> <small>318</small>'
-                                        '<small class="note">20000 files</small></td>'
-                                        "<td><b>479 ms</b>"))
-        # each impl's note rides in its own cell, never merged into one blob
-        self.assertIn('<small class="note">20000 files</small>', out)
+        # both impls get a cell, and each impl's own note rides in its own cell
+        self.assertIn('<td class="win"><b>634 ms</b> <small>634</small>'
+                      '<small class="note">recorded, 20000 files</small></td>'
+                      "<td><b>958 ms</b> <small>958</small>"
+                      '<small class="note">20000 files</small></td>', out)
         self.assertNotIn("20000 files 20000 files", out)
         self.assertIn('<small class="note">clipboard now holds cb-rs 512M'
                       " cb 4.0K</small>", out)
@@ -94,9 +90,9 @@ class Test(unittest.TestCase):
     def test_bench_py_format(self):
         """bench.py writes the rows, so its format string is the contract. LOG is
         hand-copied and cannot see bench.py change under it."""
-        for args in (("copy", "small", "cb-rs", 318, 318, 0, "20000 files"),
-                     ("paste", "4k x4000", "cb", 733, 733, 1, ""),  # rc != 0
-                     ("cut", "big", "cb-rs", 0, 0, 0, "")):
+        for args in (("copy+paste", "small", "cb-rs", 318, 318, 0, "20000 files"),
+                     ("copy+paste", "4k x4000", "cb", 733, 733, 1, ""),  # rc != 0
+                     ("cut+paste", "big", "cb-rs", 0, 0, 0, "")):
             with contextlib.redirect_stdout(io.StringIO()) as f:
                 bench.row(*args)
             self.assertIsNotNone(benchhtml.row(f.getvalue()), f.getvalue())
