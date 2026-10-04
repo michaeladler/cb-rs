@@ -1,0 +1,79 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH cb 1  "cb 0.1.0" 
+.SH NAME
+cb \- Cut, copy, and paste files
+.SH SYNOPSIS
+\fBcb\fR [\fB\-n\fR|\fB\-\-name\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Cut, copy, and paste files
+.SH OPTIONS
+.TP
+\fB\-n\fR, \fB\-\-name\fR \fI<NAME>\fR
+Clipboard to use, instead of the default
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+
+.SH COMMANDS
+.SS cb copy
+Copy files into the clipboard, leaving the originals in place
+
+.TP
+\fB\-n\fR, \fB\-\-name\fR \fI<NAME>\fR
+Clipboard to use, instead of the default
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPATHS\fR>
+Files or directories to copy
+
+.SS cb cut
+Record files to be moved when pasted. The originals stay in place until then
+
+.TP
+\fB\-n\fR, \fB\-\-name\fR \fI<NAME>\fR
+Clipboard to use, instead of the default
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIPATHS\fR>
+Files or directories to move on paste
+
+.SS cb paste
+Write the clipboard\*(Aqs files into the current directory
+
+.TP
+\fB\-d\fR, \fB\-\-directory\fR \fI<DIRECTORY>\fR
+Destination directory, defaults to the current one
+.TP
+\fB\-n\fR, \fB\-\-name\fR \fI<NAME>\fR
+Clipboard to use, instead of the default
+.TP
+\fB\-\-on\-conflict\fR \fI<ON_CONFLICT>\fR [default: skip]
+What to do when a destination file already exists
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+
+.SS cb list
+List what the clipboard holds
+
+.TP
+\fB\-n\fR, \fB\-\-name\fR \fI<NAME>\fR
+Clipboard to use, instead of the default
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+
+.SS cb help
+Print this message or the help of the given subcommand(s)
+
+
+.SH VERSION
+v0.1.0

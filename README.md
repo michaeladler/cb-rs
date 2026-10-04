@@ -54,16 +54,16 @@ Read these before pointing `cb-rs` at anything you care about.
 
 ## Man page and shell completions
 
-Both are generated from the CLI, so they cannot drift:
+See [`man/cb.1`](man/cb.1) and [`completions/`](completions). Copy them where your shell and your system look:
 
 ```sh
-cb man > cb.1
-cb completions bash > /etc/bash_completion.d/cb
-cb completions zsh  > ~/.local/share/zsh/site-functions/_cb
-cb completions fish > ~/.config/fish/completions/cb.fish
+install -Dm644 man/cb.1              /usr/local/share/man/man1/cb.1
+install -Dm644 completions/cb.bash   /etc/bash_completion.d/cb
+install -Dm644 completions/_cb       ~/.local/share/zsh/site-functions/_cb
+install -Dm644 completions/cb.fish   ~/.config/fish/completions/cb.fish
+install -Dm644 completions/cb.elv    ~/.config/elvish/lib/cb.elv
+install -Dm644 completions/_cb.ps1   ~/.config/powershell/cb.ps1
 ```
-
-`elvish` and `powershell` work the same way. `cb completions --help` explains the command itself, which is fine inside a completion script.
 
 ## Test
 

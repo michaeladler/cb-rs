@@ -23,7 +23,11 @@
   ];
 
   # https://devenv.sh/git-hooks/
-  git-hooks.hooks.shellcheck.enable = true;
+  git-hooks.hooks = {
+    rustfmt.enable = true;
+    clippy.enable = true;
+    prettier.enable = true;
+  };
 
   # See full reference at https://devenv.sh/reference/options/
 }

@@ -28,6 +28,13 @@ archives:
       {{- else }}{{ .Arch }}{{ end }}
     format_overrides:
       - formats: ['tar.zst']
+    # Nothing generates these at runtime any more, so ship them alongside the
+    # binary for packagers and anyone installing from a tarball.
+    files:
+      - src: man/*
+        dst: man
+      - src: completions/*
+        dst: completions
 
 nfpms:
   - id: cb
@@ -41,6 +48,19 @@ nfpms:
     description: faster, safer Rust rewrite of the file copy/cut/paste core of cb
     section: utils
     priority: optional
+    contents:
+      - src: man/cb.1
+        dst: man1/cb.1
+        type: man
+      - src: completions/cb.bash
+        dst: bash-completion/completions/cb
+        type: config
+      - src: completions/_cb
+        dst: zsh/site-functions/_cb
+        type: config
+      - src: completions/cb.fish
+        dst: fish/vendor_completions.d/cb.fish
+        type: config
 
 checksum:
   name_template: 'checksums.txt'

@@ -2,8 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{ArgAction, CommandFactory, Parser, Subcommand};
-use clap_complete::Shell;
+use argh::FromArgs;
 
 use cb_rs::mover;
 use cb_rs::paths::{self, Clipboard};
@@ -11,88 +10,197 @@ use cb_rs::policy::Policy;
 use cb_rs::walk;
 use cb_rs::walk::Failure;
 
-#[derive(Parser)]
-#[command(about = "Cut, copy, and paste files", version)]
+// argh has no global options, so `-n/--name` is declared on the top level and on
+// every subcommand. That reproduces clap's `global = true`: the flag is accepted
+// before or after the subcommand.
+//
+// These fields cannot come from a `macro_rules!`, since derive macros do not
+// expand macro invocations in field position.
+//
+// The comment above is `//` and not a doc comment on purpose: argh turns a doc
+// comment on the struct into the command description in `--help`.
+#[derive(FromArgs)]
+/// Cut, copy, and paste files
+#[argh(help_triggers("-h", "--help", "help"))]
 struct Cli {
-    /// Clipboard to use, instead of the default.
-    #[arg(short, long, global = true)]
-    name: Option<String>,
-
-    #[command(subcommand)]
+    #[argh(subcommand)]
     command: Command,
+
+    /// clipboard to use, instead of the default.
+    #[argh(option, short = 'n')]
+    name: Option<String>,
 }
 
-#[derive(Subcommand)]
+#[derive(FromArgs)]
+#[argh(subcommand)]
 enum Command {
-    /// Copy files into the clipboard, leaving the originals in place.
-    Copy {
-        /// Files or directories to copy.
-        #[arg(required = true, action = ArgAction::Append)]
-        paths: Vec<PathBuf>,
-    },
-    /// Record files to be moved when pasted. The originals stay in place until
-    /// then.
-    Cut {
-        /// Files or directories to move on paste.
-        #[arg(required = true, action = ArgAction::Append)]
-        paths: Vec<PathBuf>,
-    },
-    /// Write the clipboard's files into the current directory.
-    Paste {
-        /// Destination directory, defaults to the current one.
-        #[arg(short, long)]
-        directory: Option<PathBuf>,
-        /// What to do when a destination file already exists.
-        #[arg(long, default_value = "skip")]
-        on_conflict: Policy,
-    },
-    /// List what the clipboard holds.
-    List,
-    /// Print a shell completion script to stdout.
-    Completions {
-        #[arg(value_enum)]
-        shell: Shell,
-    },
-    /// Print the roff man page to stdout.
-    Man,
+    Copy(Copy),
+    Cut(Cut),
+    Paste(Paste),
+    List(List),
+}
+
+impl Command {
+    fn name(&self) -> Option<&String> {
+        match self {
+            Self::Copy(c) => c.name.as_ref(),
+            Self::Cut(c) => c.name.as_ref(),
+            Self::Paste(c) => c.name.as_ref(),
+            Self::List(c) => c.name.as_ref(),
+        }
+    }
+}
+
+#[derive(FromArgs)]
+/// Copy files into the clipboard, leaving the originals in place
+#[argh(subcommand, name = "copy", help_triggers("-h", "--help"))]
+struct Copy {
+    /// clipboard to use, instead of the default.
+    #[argh(option, short = 'n')]
+    name: Option<String>,
+
+    /// files or directories to copy.
+    #[argh(positional)]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(FromArgs)]
+/// Record files to be moved when pasted. The originals stay in place until then
+#[argh(subcommand, name = "cut", help_triggers("-h", "--help"))]
+struct Cut {
+    /// clipboard to use, instead of the default.
+    #[argh(option, short = 'n')]
+    name: Option<String>,
+
+    /// files or directories to move on paste.
+    #[argh(positional)]
+    paths: Vec<PathBuf>,
+}
+
+#[derive(FromArgs)]
+/// Write the clipboard's files into the current directory
+#[argh(subcommand, name = "paste", help_triggers("-h", "--help"))]
+struct Paste {
+    /// destination directory, defaults to the current one.
+    #[argh(option, short = 'd')]
+    directory: Option<PathBuf>,
+
+    /// clipboard to use, instead of the default.
+    #[argh(option, short = 'n')]
+    name: Option<String>,
+
+    /// what to do when a destination file already exists.
+    #[argh(option, default = "Policy::Skip", from_str_fn(parse_policy))]
+    on_conflict: Policy,
+}
+
+#[derive(FromArgs)]
+/// List what the clipboard holds
+#[argh(subcommand, name = "list", help_triggers("-h", "--help"))]
+struct List {
+    /// clipboard to use, instead of the default.
+    #[argh(option, short = 'n')]
+    name: Option<String>,
+}
+
+fn parse_policy(value: &str) -> Result<Policy, String> {
+    value
+        .parse()
+        .map_err(|_| "expected \"skip\", \"replace\" or \"ask\"".into())
+}
+
+/// argh accepts neither `--flag=value` nor an attached short value (`-nfoo`),
+/// both of which cb accepted under clap. Rewrite them into the two-token form
+/// before argh sees them.
+fn normalise(argv: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut literals = false;
+    for arg in argv {
+        if literals {
+            out.push(arg);
+        } else if arg == "--" {
+            literals = true;
+            out.push(arg);
+        } else if let Some((flag, value)) = arg.split_once('=').filter(|_| arg.starts_with("--")) {
+            out.push(flag.to_string());
+            out.push(value.to_string());
+        } else if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 2 {
+            out.push(arg[..2].to_string());
+            out.push(arg[2..].to_string());
+        } else {
+            out.push(arg);
+        }
+    }
+    out
+}
+
+/// argh has no `--version` (the Fuchsia spec it follows has none) and exits 1 on
+/// every usage error, where cb has always exited 2. `EarlyExit` carries the
+/// message and whether it was an error, so both are handled here.
+fn parse_args(argv: Vec<String>) -> Result<Cli, ExitCode> {
+    let argv = normalise(argv);
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        let mut stdout = std::io::stdout();
+        let _ = writeln!(stdout, "cb-rs {}", env!("CARGO_PKG_VERSION"));
+        return Err(ExitCode::SUCCESS);
+    }
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match Cli::from_args(&["cb"], &argv) {
+        Ok(cli) => Ok(cli),
+        Err(exit) => {
+            // argh sends everything to stdout; usage errors belong on stderr.
+            if exit.status.is_err() {
+                let _ = std::io::stderr().write_all(exit.output.as_bytes());
+                Err(ExitCode::from(2))
+            } else {
+                let _ = std::io::stdout().write_all(exit.output.as_bytes());
+                Err(ExitCode::SUCCESS)
+            }
+        }
+    }
+}
+
+/// argh reads a `Vec` positional as zero-or-more, so `cb copy` with no paths
+/// would otherwise parse clean and report success having copied nothing.
+fn require_paths(sub: &str, paths: &[PathBuf]) -> Result<(), ExitCode> {
+    if !paths.is_empty() {
+        return Ok(());
+    }
+    let _ = std::io::stderr().write_all(
+        format!(
+            "error: the following required arguments were not provided:\n  \
+             <PATHS>...\n\nUsage: cb {sub} <PATHS>...\n\n\
+             For more information, try '--help'.\n"
+        )
+        .as_bytes(),
+    );
+    Err(ExitCode::from(2))
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match parse_args(std::env::args().skip(1).collect()) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
 
-    // Generation-only commands: no clipboard, no IO.
-    match &cli.command {
-        Command::Completions { shell } => {
-            // Buffer it: clap_complete panics on a broken pipe, so `cb
-            // completions bash | head` would abort instead of exiting 0.
-            let mut script = Vec::new();
-            clap_complete::generate(*shell, &mut Cli::command(), "cb", &mut script);
-            let _ = std::io::stdout().write_all(&script);
-            return ExitCode::SUCCESS;
-        }
-        Command::Man => {
-            // Same broken-pipe handling as completions.
-            let _ = std::io::stdout().write_all(man_page().as_bytes());
-            return ExitCode::SUCCESS;
-        }
-        _ => {}
-    }
-
-    let clipboard = Clipboard::open(cli.name.as_deref().unwrap_or(paths::DEFAULT_NAME));
+    let name = cli.command.name().or(cli.name.as_ref());
+    let clipboard = Clipboard::open(name.map_or(paths::DEFAULT_NAME, String::as_str));
 
     let result = match cli.command {
-        Command::Copy { paths } => do_copy(&clipboard, &paths),
-        Command::Cut { paths } => do_cut(&clipboard, &paths),
-        Command::Paste {
-            directory,
-            on_conflict,
-        } => do_paste(
+        Command::Copy(c) => match require_paths("copy", &c.paths) {
+            Ok(()) => do_copy(&clipboard, &c.paths),
+            Err(code) => return code,
+        },
+        Command::Cut(c) => match require_paths("cut", &c.paths) {
+            Ok(()) => do_cut(&clipboard, &c.paths),
+            Err(code) => return code,
+        },
+        Command::Paste(p) => do_paste(
             &clipboard,
-            directory.as_deref().unwrap_or(Path::new(".")),
-            on_conflict,
+            p.directory.as_deref().unwrap_or(Path::new(".")),
+            p.on_conflict,
         ),
-        Command::List => do_list(&clipboard),
-        Command::Completions { .. } | Command::Man => unreachable!(),
+        Command::List(_) => do_list(&clipboard),
     };
 
     match result {
@@ -102,59 +210,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// One self-contained page. clap_mangen's subcommand list cross-references
-/// `cb-copy(1)`, `cb-paste(1)` & co, pages nobody generates, so drop it and
-/// inline each subcommand's description and options instead.
-fn man_page() -> String {
-    // Package is cb-rs, the command users type is cb.
-    let mut cmd = Cli::command().name("cb");
-    cmd.build();
-    let mut page = section(&render_man(&cmd), "SUBCOMMANDS", false);
-
-    let mut commands = String::from(".SH COMMANDS\n");
-    for sub in cmd.get_subcommands() {
-        let sub_page = render_man(sub);
-        commands.push_str(&format!(
-            ".SS cb {}\n{}\n{}\n",
-            sub.get_name(),
-            section(&sub_page, "DESCRIPTION", true),
-            section(&sub_page, "OPTIONS", true)
-        ));
-    }
-    // VERSION renders before SUBCOMMANDS; keep it last.
-    match page.split_once(".SH VERSION\n") {
-        Some((head, tail)) => page = format!("{head}\n{commands}.SH VERSION\n{tail}"),
-        None => page.push_str(&commands),
-    }
-    page
-}
-
-fn render_man(cmd: &clap::Command) -> String {
-    let mut roff = Vec::new();
-    let _ = clap_mangen::Man::new(cmd.clone()).render(&mut roff);
-    String::from_utf8_lossy(&roff).into_owned()
-}
-
-/// Keep, or drop, the body of one `.SH` section of generated roff. Its heading
-/// always goes: the caller supplies its own, or it belongs to another section.
-fn section(roff: &str, name: &str, keep: bool) -> String {
-    let mut out = String::new();
-    let mut inside = false;
-    for line in roff.lines() {
-        if let Some(heading) = line.strip_prefix(".SH ") {
-            inside = heading == name;
-            if !inside && !keep {
-                out.push_str(line);
-                out.push('\n');
-            }
-        } else if inside == keep {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
 }
 
 fn do_copy(clipboard: &Clipboard, items: &[PathBuf]) -> Result<(), String> {

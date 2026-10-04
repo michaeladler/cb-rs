@@ -1,0 +1,10 @@
+# Size flags for the release binary. Scoped to Linux: the goreleaser build
+# cross-compiles to darwin from Linux.
+#
+# Reaches proc-macro dylibs too, because the cfg is evaluated per artifact and
+# the host is Linux.
+[target.'cfg(target_os = "linux")']
+rustflags = [
+    # panic = "abort" already removed the unwinder, so the FDEs are dead weight.
+    "-Cforce-unwind-tables=no",
+]
