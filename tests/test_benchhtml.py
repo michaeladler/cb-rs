@@ -1,4 +1,4 @@
-import contextlib, io, os, re, shutil, sys, tempfile, unittest
+import contextlib, io, os, re, shutil, sys, tempfile, time, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import bench
 import benchhtml
@@ -131,6 +131,34 @@ class Test(unittest.TestCase):
         try:
             self.assertEqual(bench.cb_paste(child, dest), 0)
         finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_cb_paste_gives_up_on_a_wedged_child(self):
+        """A child that never closes the pty must not hold the bench forever.
+
+        cb paste forks children that outlive it and keep the slave fd open, so
+        EOF never arrives on its own. With no ceiling the drain waits out the
+        whole workflow timeout; the ceiling kills the child instead.
+        """
+        d = tempfile.mkdtemp()
+        child = os.path.join(d, "spin")
+        with open(child, "w") as f:
+            f.write("#!/usr/bin/env python3\n"
+                    "import sys, time\n"
+                    "sys.argv[1:]\n"
+                    "print('x' * 100)\n"
+                    "time.sleep(3600)\n")  # never exits, never closes the pty
+        os.chmod(child, 0o755)
+        dest = os.path.join(d, "dest")
+        os.makedirs(dest)
+        limit, bench.LIMIT = bench.LIMIT, 2.0
+        try:
+            start = time.monotonic()
+            rc = bench.cb_paste(child, dest)
+            self.assertLess(time.monotonic() - start, 30)
+            self.assertNotEqual(rc, 0)  # killed, not a clean exit
+        finally:
+            bench.LIMIT = limit
             shutil.rmtree(d, ignore_errors=True)
 
     def test_escapes(self):

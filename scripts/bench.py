@@ -23,6 +23,7 @@ Usage: scripts/bench.py [reps]
 
 import os
 import pty
+import select
 import shutil
 import statistics
 import subprocess
@@ -38,6 +39,12 @@ BIG = 512 << 20
 SMALL_LOCAL = 20000
 SMALL_CROSS = 4000
 REPS = 5
+
+# cb paste holds the pty open past its own exit by way of children that outlive
+# it, so the drain needs a ceiling or the run waits out the workflow timeout.
+# Generous: the slowest paste measured here is well under a second.
+LIMIT = 120.0
+GAP = 5.0  # poll interval only; a quiet read is not a reason to give up
 
 QUIET = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 
@@ -120,6 +127,21 @@ def fs_of(path):
 # cb paste silently does nothing without a terminal, so every cb paste runs
 # under a pty. The pty also has to answer cb's overwrite prompt: on EOF it spins
 # forever at 100% CPU. cb copy/cut work headless and are timed directly.
+def _drain(master, deadline):
+    """Read the pty until cb closes it. True if EOF was reached, False on deadline."""
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        if not select.select([master], [], [], min(left, GAP))[0]:
+            continue  # quiet, not gone: a slow paste is not a wedged one
+        try:
+            if not os.read(master, 65536):
+                return True
+        except OSError:
+            return True  # EOF read raises on a pty
+
+
 def cb_paste(bin, dest):
     """Paste into dest with cb's stdin/stdout/stderr on a pty. 200 `n` answers
     are queued up front, which is more prompts than any paste here can produce."""
@@ -130,17 +152,16 @@ def cb_paste(bin, dest):
         os.close(slave)  # the child holds the only other copy: dropping it here
                          # is what lets the read below reach EOF
         os.write(master, b"n\n" * 200)
-        # cb only prompts on a tty, so its output cannot go to /dev/null. Read
-        # to EOF; the EOF read raises, hence the except. No select timeout: a
-        # gap longer than any timeout here means cb is thinking, not gone, and
-        # bailing out early leaves the pty undrained -- cb then blocks writing
-        # into a full buffer and p.wait() blocks forever.
-        while True:
-            try:
-                if not os.read(master, 65536):
-                    break
-            except OSError:
-                break
+        # cb only prompts on a tty, so its output cannot go to /dev/null, and
+        # the pty has to be drained to EOF or cb blocks writing into a full
+        # buffer and p.wait() blocks forever. The drain gets a deadline, not a
+        # per-read timeout: cb paste forks children that outlive it and keep
+        # the slave fd open, so EOF can never arrive on its own and the job
+        # would sit until the workflow timeout.
+        if not _drain(master, time.monotonic() + LIMIT):
+            p.kill()
+            _drain(master, time.monotonic() + LIMIT)  # unblock the corpse
+            return p.wait()
         return p.wait()
     finally:
         os.close(master)
