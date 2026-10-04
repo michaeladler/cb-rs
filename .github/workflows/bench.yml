@@ -7,16 +7,22 @@ on:
     inputs:
       reps:
         description: repetitions per row
-        default: '5'
+        default: "5"
   schedule:
-    - cron: '17 4 * * 1'
+    - cron: "17 4 * * 1"
 
 # Pushing the gh-pages branch needs write; nothing else does.
 permissions:
   contents: write
 
 jobs:
+  # One run per CoW filesystem: the copy ladder reaches FICLONE by a different
+  # kernel path on each, and the rows are only comparable within one run.
   bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [btrfs, xfs]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -29,7 +35,7 @@ jobs:
       - name: install cb 0.10.0 and filesystem tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq btrfs-progs
+          sudo apt-get install -y -qq btrfs-progs xfsprogs
           # libasound2 is t64 on 24.04 and unsuffixed before it.
           sudo apt-get install -y -qq libasound2t64 || sudo apt-get install -y -qq libasound2
           mkdir -p "$RUNNER_TEMP/cb"
@@ -48,23 +54,37 @@ jobs:
 
       - run: cargo build --release
 
-      - name: mount the btrfs volume
-        run: scripts/testvol.sh btrfs
+      - name: mount the ${{ matrix.fs }} volume
+        run: scripts/testvol.sh "${{ matrix.fs }}"
 
       - name: bench
+        env:
+          CB_BENCH_VOL: ${{ github.workspace }}/mount-${{ matrix.fs }}
         run: |
           set -o pipefail
-          scripts/bench.py "${{ github.event.inputs.reps || '5' }}" 2>&1 | tee bench.log
+          scripts/bench.py "${{ github.event.inputs.reps || '5' }}" 2>&1 \
+            | tee "bench-${{ matrix.fs }}.log"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bench-log
-          path: bench.log
+          name: bench-${{ matrix.fs }}
+          path: bench-${{ matrix.fs }}.log
 
-      # One HTML page plus the raw log, published from a scratch repo rather than
-      # a branch of this checkout: gh-pages holds the site and nothing else, and
-      # an unrelated history each run means no fetch, no orphan dance, no
-      # clobbering the working tree.
+  # One page per run plus an index, published from a scratch repo rather than a
+  # branch of this checkout: gh-pages holds the site and nothing else, and an
+  # unrelated history each run means no fetch, no orphan dance, no clobbering
+  # the working tree. One job, not one per matrix leg: two jobs pushing the same
+  # branch race, and the loser loses the run's numbers.
+  publish:
+    needs: bench
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: logs
+
       - name: publish to gh-pages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -74,8 +94,14 @@ jobs:
           site="$RUNNER_TEMP/site"
           export site
           mkdir -p "$site"
-          cp bench.log "$site/"
-          scripts/benchhtml.py bench.log "$site/index.html"
+          cp logs/*/*.log "$site/"
+          vol=()
+          for log in "$site"/bench-*.log; do
+            fs=$(basename "$log" .log)
+            scripts/benchhtml.py "$log" "$site/$fs.html"
+            vol+=("${fs#bench-}")
+          done
+          scripts/benchhtml.py --index "$site/index.html" "${vol[@]}"
           cd "$site"
           git init -q -b gh-pages
           git config user.name github-actions[bot]

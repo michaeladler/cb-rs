@@ -6,6 +6,7 @@ uploading. On the page the same numbers read better side by side, so this pairs
 each cb-rs row with its cb row and prints the ratio.
 
 Usage: scripts/benchhtml.py bench.log index.html
+       scripts/benchhtml.py --index index.html btrfs xfs
 """
 
 import datetime
@@ -198,7 +199,14 @@ a { color: inherit; }
 """
 
 
-def page(log, *, reps, date, sha, repo, runner):
+def index(names, repo):
+    """Landing page: one link per filesystem page. The bench run is a matrix, so
+    there is one page per volume rather than one page with both runs in it."""
+    # bench.py's output is kept as bench-<fs>.log, so the pages are named after it
+    items = "\n".join(
+        '  <li><a href="bench-%s.html">%s</a> &mdash; '
+        '<a href="bench-%s.log">raw log</a></li>'
+        % (html.escape(n), html.escape(n), html.escape(n)) for n in names)
     return """<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -206,6 +214,24 @@ def page(log, *, reps, date, sha, repo, runner):
 <title>cb-rs benchmarks</title>
 <style>%s</style>
 <h1>cb-rs benchmarks</h1>
+<p class="lede">scripts/bench.py against <code>cb</code> 0.10.0, one run per
+loop volume. See the <a href="%s#benchmarks">README</a> for what each shape
+measures and how to run this yourself.</p>
+<ul>
+%s
+</ul>
+</html>
+""" % (CSS, html.escape(repo), items)
+
+
+def page(log, *, reps, date, sha, repo, runner, title="cb-rs benchmarks"):
+    return """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s</title>
+<style>%s</style>
+<h1>%s</h1>
 <p class="lede">scripts/bench.py, %s reps per row, against <code>cb</code> 0.10.0.
 Median of the reps, minimum in brackets; the faster side of each pair is green.</p>
 <dl>
@@ -217,14 +243,23 @@ Median of the reps, minimum in brackets; the faster side of each pair is green.<
 to run this yourself.</p>
 %s
 </html>
-""" % (CSS, html.escape(reps), date, repo, sha, sha,
-       html.escape(runner), repo, render(log))
+""" % (html.escape(title), CSS, html.escape(title), html.escape(reps), date,
+       repo, sha, sha, html.escape(runner), repo, render(log))
 
 
 def main():
+    # The workflow runs one bench per filesystem, so the index lists them.
+    if sys.argv[1] == "--index":
+        out, names = sys.argv[2], sys.argv[3:]
+        repo = os.environ.get("GITHUB_REPOSITORY", "michaeladler/cb-rs")
+        with open(out, "w") as f:
+            f.write(index(names, repo))
+        return
+
     log, out = sys.argv[1], sys.argv[2]
     with open(log, errors="replace") as f:
         text = f.read()
+    vol = os.path.splitext(os.path.basename(log))[0].replace("bench-", "")
     sha = os.environ.get("GITHUB_SHA", "local")
     repo = os.environ.get("GITHUB_REPOSITORY", "michaeladler/cb-rs")
     with open(out, "w") as f:
@@ -235,6 +270,7 @@ def main():
             sha=html.escape(sha[:12]),
             repo=html.escape(repo).join(("https://github.com/", "/")),
             runner=html.escape("%s, %s cores" % (platform.platform(), os.cpu_count())),
+            title="cb-rs benchmarks: %s" % vol,
         ))
 
 

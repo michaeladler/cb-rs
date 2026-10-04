@@ -166,6 +166,17 @@ class Test(unittest.TestCase):
         self.assertNotIn("<>", out)
         self.assertIn("&amp;&lt;&gt;", out)
 
+    def test_index_links_bench_prefixed_pages(self):
+        # The publish job renders bench-<fs>.html from bench-<fs>.log, so the
+        # index has to use those names or it links a page that was never built.
+        out = benchhtml.index(["btrfs", "xfs"], "michaeladler/cb-rs")
+        for fs in ("btrfs", "xfs"):
+            self.assertIn('href="bench-%s.html"' % fs, out)
+            self.assertIn('href="bench-%s.log"' % fs, out)
+
+    def test_index_escapes_names(self):
+        self.assertNotIn("<>", benchhtml.index(["a<b"], "o/r"))
+
 
 if __name__ == "__main__":
     unittest.main()
