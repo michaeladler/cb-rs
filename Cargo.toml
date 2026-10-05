@@ -2,6 +2,7 @@
 name = "cb-rs"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0" # must match LICENSE; `cargo deny check licenses` fails without it
 
 [dependencies]
 argh = "0.1.19"
@@ -13,8 +14,8 @@ name = "cb"
 path = "src/main.rs"
 
 [profile.release]
-opt-level = "z"       # cb is IO bound; measured no throughput cost vs 3
-lto = true            # Enable "Fat" Link-Time Optimization across all crates
-codegen-units = 1     # Reduce parallel compilation units to 1 for maximum overall optimization
-panic = "abort"       # Remove unwinding code; drastically drops binary size and slightly boosts speed
-strip = true          # Automatically strip debug symbols and symbols from the binary
+opt-level = "z"   # cb is IO bound; measured no throughput cost vs 3
+lto = true        # Enable "Fat" Link-Time Optimization across all crates
+codegen-units = 1 # Reduce parallel compilation units to 1 for maximum overall optimization
+panic = "abort"   # Remove unwinding code; drastically drops binary size and slightly boosts speed
+strip = true      # Automatically strip debug symbols and symbols from the binary

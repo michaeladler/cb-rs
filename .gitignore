@@ -15,6 +15,7 @@ mount*/
 
 target
 __pycache__
+/result
 
 # scripts/bench.py output; CI publishes it on the gh-pages branch
 bench.log

@@ -1,5 +1,6 @@
 [![ci](https://github.com/michaeladler/cb-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/michaeladler/cb-rs/actions/workflows/ci.yml)
 [![bench](https://github.com/michaeladler/cb-rs/actions/workflows/bench.yml/badge.svg)](https://github.com/michaeladler/cb-rs/actions/workflows/bench.yml)
+[![codecov](https://codecov.io/github/michaeladler/cb-rs/graph/badge.svg?token=hGEBYzrSIB)](https://codecov.io/github/michaeladler/cb-rs)
 
 # cb-rs
 
@@ -123,6 +124,18 @@ Caveats above cover the semantics; this is where the speed comes from.
 This is deliberately a different directory from the C++ `cb`'s `$XDG_STATE_HOME/clipboard`. The two tools cannot read each other's clipboards, and sharing the directory would have been worse than useless: every upstream entry holds real bytes, and `cb clear` or a history trim under a byte, age or count limit deletes an entry outright, which under the shared root took the other tool's staged data with it. `cb-rs` stages nothing, so it keeps two small lists and nothing else.
 
 Upgrading from a `cb-rs` that shared the C++ `cb` root leaves that old clipboard where it is. Delete `~/.local/state/clipboard` by hand once you are sure you have nothing pending in the C++ `cb`; `cb-rs` no longer reads or writes it.
+
+## Development
+
+`nix develop` gives you cargo and rustc and hydrates `target/` with dependencies that are already compiled in the Nix store, so `cargo build` compiles only this crate. That works because the shell resolves crates from the same vendored store path the store build used; when the two disagree, cargo marks every dependency dirty (`PathToSourceChanged`) and rebuilds the lot.
+
+The flip side is that crates.io is replaced by that vendor directory, so `cargo add` cannot fetch anything new inside the shell:
+
+```sh
+unset CARGO_HOME   # back to crates.io for this shell; deps recompile once
+```
+
+Changing `Cargo.toml` or `Cargo.lock` needs a fresh `nix develop` so the vendor directory matches the new lock, which direnv does for you on save. `reseed-target` deletes `target/` and re-hydrates it from the store; reach for it after a rustc bump leaves stale fingerprints behind.
 
 ## Test
 

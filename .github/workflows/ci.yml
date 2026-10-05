@@ -99,25 +99,48 @@ jobs:
       - name: benchhtml unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
-  format:
-    name: cargo fmt
+  # fmt, clippy, rustdoc, taplo, cargo-audit, cargo-deny and the nextest run
+  # all live in flake.nix checks, so they get one definition and a pinned
+  # toolchain. This job replaces the standalone format and clippy jobs, which
+  # ran whatever rustup happened to hand them.
+  #
+  # `--accept-flake-config` is what lets the crane substituter named in
+  # flake.nix's nixConfig take effect; without it nix ignores it and every
+  # dependency rebuilds from source.
+  nix-check:
+    name: nix flake check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
-          components: rustfmt
-      - name: Rustfmt Check
-        uses: actions-rust-lang/rustfmt@4066006ec54a31931b9b1fddfd38f2fdf2d27143 # v1.1.2
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Setup Cachix
+        uses: cachix/cachix-action@v17
+        with:
+          name: michaeladler
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: flake check
+        run: nix flake check --accept-flake-config --show-trace -L --keep-going
 
-  lint:
-    name: cargo clippy
+  coverage:
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Setup Cachix
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
-          components: clippy
-      # --all-targets covers tests and benches; -D warnings makes clippy findings
-      # fail the job instead of scrolling past.
-      - run: cargo clippy --all-features --all-targets -- -D warnings
+          name: michaeladler
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Generate code coverage
+        # The devShell carries the toolchain and every build and test dependency.
+        run: nix develop --command cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: lcov.info
