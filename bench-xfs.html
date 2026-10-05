@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cb-rs benchmarks: xfs</title>
+<style>
+:root { color-scheme: light dark; --fg: #1b1b1b; --dim: #6a6a6a; --bg: #fff;
+        --line: #e3e3e3; --win: #0a6b3d; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #e6e6e6; --dim: #9a9a9a; --bg: #14161a; --line: #2a2e35;
+          --win: #4ade80; }
+}
+body { background: var(--bg); color: var(--fg);
+       font: 15px/1.55 system-ui, sans-serif;
+       max-width: 52rem; margin: 3rem auto; padding: 0 1.25rem; }
+h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+h2 { font-size: 1.05rem; margin: 2.25rem 0 .5rem; padding-bottom: .3rem;
+     border-bottom: 1px solid var(--line); }
+p.lede { color: var(--dim); margin-top: 0; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem;
+     margin: 1.25rem 0; font-size: .92rem; }
+dt { font-weight: 600; } dd { margin: 0; color: var(--dim); }
+table { border-collapse: collapse; width: 100%; font-size: .92rem;
+        font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--line); }
+h3 { font-size: .92rem; font-weight: 600; margin: 1.4rem 0 .2rem; color: var(--dim); }
+p.note { color: var(--dim); font-size: .88rem; margin: .3rem 0; }
+small.note { display: block; }
+th { font-weight: 600; color: var(--dim); font-size: .82rem;
+     text-transform: uppercase; letter-spacing: .04em; }
+th:nth-child(n+3), td:nth-child(n+3) { text-align: right; }
+td small, small { color: var(--dim); }
+.win b { color: var(--win); }
+pre { font: 13px/1.5 ui-monospace, monospace; color: var(--dim);
+      overflow-x: auto; margin: .6rem 0;
+      background: color-mix(in srgb, var(--fg) 5%, transparent);
+      padding: .8rem 1rem; border-radius: 6px; }
+a { color: inherit; }
+</style>
+<h1>cb-rs benchmarks: xfs</h1>
+<p class="lede">scripts/bench.py, 5 reps per row, against <code>cb</code> 0.10.0.
+Median of the reps, minimum in brackets; the faster side of each pair is green.</p>
+<dl>
+  <dt>run</dt><dd>2026-10-05 11:29 UTC</dd>
+  <dt>commit</dt><dd><a href="https://github.com/michaeladler/cb-rs/commit/40ac62ce4412">40ac62ce4412</a></dd>
+  <dt>runner</dt><dd>Linux-6.17.0-1022-azure-x86_64-with-glibc2.39, 4 cores</dd>
+</dl>
+<p>See the <a href="https://github.com/michaeladler/cb-rs/#benchmarks">README</a> for what each shape measures and how
+to run this yourself.</p>
+<h2>local: ext4 -&gt; ext4</h2>
+<p class="note">fixture: 20000 small files, 512 MiB single file</p>
+<table><thead><tr><th>op</th><th>workload</th><th>cb-rs</th><th>cb</th><th>speedup</th></tr></thead><tbody><tr><td>copy+paste</td><td>small</td><td class="win"><b>320 ms</b> <small>190</small><small class="note">recorded, 20000 files</small></td><td><b>791 ms</b> <small>784</small><small class="note">20000 files</small></td><td>2.5&times;</td></tr><tr><td>copy+paste</td><td>big</td><td class="win"><b>160 ms</b> <small>158</small><small class="note">recorded, 1 files</small></td><td><b>360 ms</b> <small>327</small><small class="note">1 files</small></td><td>2.2&times;</td></tr></tbody></table>
+<h3>cut+paste small -&gt; /home/runner/bench/cut_r</h3>
+<table><tbody><tr><td>cut+paste</td><td>small</td><td class="win"><b>1 ms</b> <small>1</small><small class="note">20000 files</small></td><td><b>1091 ms</b> <small>1088</small><small class="note">20000 files</small></td><td>1091&times;</td></tr></tbody></table>
+<h3>cut+paste big -&gt; /home/runner/bench/cut_r</h3>
+<table><tbody><tr><td>cut+paste</td><td>big</td><td class="win"><b>1 ms</b> <small>1</small><small class="note">1 files</small></td><td><b>430 ms</b> <small>406</small><small class="note">1 files</small></td><td>430&times;</td></tr></tbody></table>
+<h2>cross-fs: ext4 -&gt; xfs</h2>
+<table><thead><tr><th>op</th><th>workload</th><th>cb-rs</th><th>cb</th><th>speedup</th></tr></thead><tbody><tr><td>copy+paste</td><td>512M</td><td class="win"><b>177 ms</b> <small>166</small><small class="note">1 files</small></td><td><b>307 ms</b> <small>300</small><small class="note">1 files</small></td><td>1.7&times;</td></tr><tr><td>copy+paste</td><td>4k x4000</td><td><b>198 ms</b> <small>117</small><small class="note">4000 files</small></td><td class="win"><b>181 ms</b> <small>180</small><small class="note">4000 files</small></td><td>0.9&times;</td></tr></tbody></table>
+<h2>cross-fs cut+paste: ext4 -&gt; xfs</h2>
+<h3>cut+paste x -&gt; /home/runner/work/cb-rs/cb-rs/mount-xfs/bench/d_r</h3>
+<table><thead><tr><th>op</th><th>workload</th><th>cb-rs</th><th>cb</th><th>speedup</th></tr></thead><tbody><tr><td>cut+paste</td><td>x</td><td class="win"><b>241 ms</b> <small>232</small><small class="note">1 files</small></td><td><b>374 ms</b> <small>369</small><small class="note">1 files</small></td><td>1.6&times;</td></tr></tbody></table>
+<h3>cut+paste y -&gt; /home/runner/work/cb-rs/cb-rs/mount-xfs/bench/d_r</h3>
+<table><tbody><tr><td>cut+paste</td><td>y</td><td class="win"><b>253 ms</b> <small>154</small><small class="note">4000 files</small></td><td><b>257 ms</b> <small>250</small><small class="note">4000 files</small></td><td>1.0&times;</td></tr></tbody></table>
+<h2>reflink: xfs -&gt; xfs</h2>
+<table><thead><tr><th>op</th><th>workload</th><th>cb-rs</th><th>cb</th><th>speedup</th></tr></thead><tbody><tr><td>copy+paste</td><td>512M</td><td class="win"><b>1 ms</b> <small>1</small><small class="note">1 files</small></td><td><b>274 ms</b> <small>266</small><small class="note">1 files</small></td><td>274&times;</td></tr></tbody></table>
+<h2>retention: 5 copy+paste round trips, nothing emptied in between</h2>
+<table><thead><tr><th>op</th><th>workload</th><th>cb-rs</th><th>cb</th><th>speedup</th></tr></thead><tbody><tr><td>copy+paste</td><td>x5</td><td class="win"><b>3619 ms</b> <small>3619</small><small class="note">clipboard now holds cb-rs 16K cb 32K</small></td><td><b>9106 ms</b> <small>9106</small><small class="note">clipboard now holds cb-rs 4.0K cb 2.6G</small></td><td>2.5&times;</td></tr></tbody></table>
+<h2>space</h2>
+<pre>Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   62G   83G  43% /
+/dev/loop0       10G  1.3G  8.8G  13% /home/runner/work/cb-rs/cb-rs/mount-xfs</pre>
+</html>
