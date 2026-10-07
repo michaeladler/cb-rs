@@ -1,6 +1,5 @@
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 #[cfg(target_os = "linux")]
@@ -21,9 +20,14 @@ const FICLONE: rustix::ioctl::Opcode = opcode::write::<i32>(0x94, 9);
 
 const CHUNK: usize = 1 << 20;
 /// `copy_file_range` allocates no buffer, so this is only an upper bound on how
-/// much one call may move; the kernel stops at EOF.
+/// much one call may move; the kernel stops at EOF. Kept small so the progress
+/// counter moves smoothly; the syscall cost per 8 MiB is negligible.
 #[cfg(target_os = "linux")]
-const CFR_MAX: u64 = 64 << 20;
+const CFR_MAX: u64 = 8 << 20;
+
+/// Process-wide totals for the progress display. Monotonic; readers diff them.
+pub static BYTES: AtomicU64 = AtomicU64::new(0);
+pub static FILES: AtomicU64 = AtomicU64::new(0);
 
 /// The `(source device, destination device)` pair a rung has refused, 0 while
 /// undecided. Asking the whole ladder costs three syscalls per file and none of
@@ -48,15 +52,24 @@ fn pair(src: u64, dst: u64) -> u64 {
 ///
 /// The two rungs below it are Linux syscalls; elsewhere only `copy_stream` runs.
 /// `src_st` is unused there, and the fd stays unread until then.
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub fn clone_file(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
+    let method = clone_any(src, dst, src_st)?;
+    FILES.fetch_add(1, Relaxed);
+    Ok(method)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn clone_any(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
     #[cfg(target_os = "linux")]
     {
         let key = pair(src_st.st_dev, rustix::fs::fstat(dst)?.st_dev);
 
         if NO_REF_LINK.load(Relaxed) != key {
             match try_reflink(src, dst) {
-                Ok(()) => return Ok(Method::Reflink),
+                Ok(()) => {
+                    BYTES.fetch_add(src_st.st_size.max(0) as u64, Relaxed);
+                    return Ok(Method::Reflink);
+                }
                 Err(e) if unavailable(e) => NO_REF_LINK.store(key, Relaxed),
                 // Transient: let the next rung have a go rather than give up.
                 Err(_) => {}
@@ -73,7 +86,10 @@ pub fn clone_file(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method>
         while remaining > 0 && NO_CFR.load(Relaxed) != key {
             match copy_file_range(src, None, dst, None, remaining.min(CFR_MAX) as usize) {
                 Ok(0) => break,
-                Ok(n) => remaining -= n as u64,
+                Ok(n) => {
+                    remaining -= n as u64;
+                    BYTES.fetch_add(n as u64, Relaxed);
+                }
                 Err(e) if unavailable(e) => {
                     NO_CFR.store(key, Relaxed);
                     break;
@@ -159,7 +175,9 @@ fn copy_stream(src: &OwnedFd, dst: &OwnedFd) -> Result<()> {
 fn write_all(dst: &OwnedFd, buf: &[u8]) -> Result<()> {
     let mut written = 0;
     while written < buf.len() {
-        written += rustix::io::write(dst, &buf[written..])?;
+        let n = rustix::io::write(dst, &buf[written..])?;
+        written += n;
+        BYTES.fetch_add(n as u64, Relaxed);
     }
     Ok(())
 }
@@ -270,6 +288,22 @@ mod tests {
         let dst = tmp.open();
         let write_only: OwnedFd = OpenOptions::new().write(true).open(&tmp.0).unwrap().into();
         assert!(copy_stream(&write_only, &dst).is_err());
+    }
+
+    #[test]
+    fn clone_file_counts_bytes_and_files() {
+        let (src_tmp, dst_tmp) = (Tmp::new("count-src"), Tmp::new("count-dst"));
+        let data = pattern(3 * CHUNK + 5);
+        fs::write(&src_tmp.0, &data).unwrap();
+        let src: OwnedFd = File::open(&src_tmp.0).unwrap().into();
+        let st = rustix::fs::fstat(&src).unwrap();
+        let (bytes0, files0) = (BYTES.load(Relaxed), FILES.load(Relaxed));
+
+        clone_file(&src, &dst_tmp.open(), &st).unwrap();
+
+        // Other tests share the counters, so only a lower bound holds.
+        assert!(BYTES.load(Relaxed) - bytes0 >= data.len() as u64);
+        assert!(FILES.load(Relaxed) - files0 >= 1);
     }
 
     #[test]

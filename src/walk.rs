@@ -62,6 +62,10 @@ impl Report {
 /// Copy `src` to `dst` (creating it), recursing into directories in parallel.
 /// Returns every entry that could not be copied.
 pub fn copy_any(src: &Path, dst: &Path) -> Vec<Failure> {
+    crate::progress::track(src, || copy_tree(src, dst))
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Vec<Failure> {
     let report = Report::default();
     let Ok(st) = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW) else {
         report.fail(src, Errno::NOENT);
