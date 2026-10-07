@@ -1,13 +1,16 @@
 use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU32, AtomicUsize,
+    Ordering::{AcqRel, Relaxed, Release},
+};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_deque::{Injector, Steal, Worker};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, CWD, Dir, FileType, Mode, OFlags, chmodat, mkdirat, openat, readlinkat, renameat,
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, fchmod, mkdirat, openat, readlinkat, renameat,
     statat, symlinkat, unlinkat,
 };
 use rustix::io::{Errno, Result as IoResult};
@@ -75,8 +78,8 @@ impl Report {
         });
     }
 
-    fn take(self) -> Vec<Failure> {
-        self.failures.into_inner().unwrap()
+    fn take(&self) -> Vec<Failure> {
+        std::mem::take(&mut *self.failures.lock().unwrap())
     }
 }
 
@@ -87,7 +90,7 @@ pub fn copy_any(src: &Path, dst: &Path) -> Vec<Failure> {
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Vec<Failure> {
-    let report = Report::default();
+    let report = Arc::new(Report::default());
     let Ok(st) = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW) else {
         report.fail(src, Errno::NOENT);
         return report.take();
@@ -101,12 +104,23 @@ fn copy_tree(src: &Path, dst: &Path) -> Vec<Failure> {
                 report.fail(src, e);
                 return report.take();
             }
-            walk(DirTask::new(src.to_path_buf(), dst.to_path_buf()), &report);
-            // Applied last: a read-only or execute-only source directory must
-            // still be writable while its children are being created.
-            if let Err(e) = chmodat(CWD, dst, Mode::from_raw_mode(st.st_mode), AtFlags::empty()) {
-                report.fail(dst, e);
-            }
+            // The node applies the source mode via `fchmod` once the whole
+            // subtree is in place. A read-only or execute-only source
+            // directory must still be writable while its children are being
+            // created, so the chmod cannot happen here.
+            let node = DirNode::new(
+                Mode::from_raw_mode(st.st_mode),
+                dst.to_path_buf(),
+                None,
+                &report,
+            );
+            walk(
+                DirTask {
+                    src: src.to_path_buf(),
+                    node,
+                },
+                &report,
+            );
         }
         FileType::Symlink => {
             if let Err(e) = copy_symlink_path(src, dst) {
@@ -127,21 +141,93 @@ fn copy_tree(src: &Path, dst: &Path) -> Vec<Failure> {
     report.take()
 }
 
-struct DirTask {
-    src: PathBuf,
+/// Completion bookkeeping for one destination directory.
+///
+/// A directory is created writable (`RWXU`) and later restricted to the
+/// source's mode, because a read-only or execute-only source directory must
+/// still be writable while its children are being created. The restriction
+/// therefore cannot happen when the directory is created, nor when the worker
+/// that owns it has merely finished iterating: the subdirectory tasks it
+/// pushed during that iteration have not run yet.
+///
+/// Each node counts the work outstanding beneath it — its own entry list, plus
+/// one per subdirectory — and applies its mode when the count reaches zero.
+///
+/// The node keeps only the path, never an fd: holding one open descriptor per
+/// queued task pins descriptors for the whole subtree's lifetime and exhausts
+/// the process limit on a wide tree (a directory with 2,000 subdirectories
+/// would hold 2,000 fds before any of them is processed). The finalizer
+/// instead opens the destination just before the `fchmod` and closes it right
+/// after, and the open is `NOFOLLOW`-guarded, so a directory swapped for a
+/// symlink before finalization is reported rather than chmod-followed.
+struct DirNode {
+    mode: Mode,
     dst: PathBuf,
+    pending: AtomicUsize,
+    parent: Option<Arc<DirNode>>,
+    report: Arc<Report>,
 }
 
-impl DirTask {
-    fn new(src: PathBuf, dst: PathBuf) -> Self {
-        Self { src, dst }
+impl DirNode {
+    fn new(
+        mode: Mode,
+        dst: PathBuf,
+        parent: Option<Arc<DirNode>>,
+        report: &Arc<Report>,
+    ) -> Arc<Self> {
+        // Keep the parent's count above zero until this child is done.
+        if let Some(p) = &parent {
+            // Release so the child's own registration happens-before any
+            // parent finalizer that observes its count.
+            p.pending.fetch_add(1, Release);
+        }
+        Arc::new(Self {
+            mode,
+            dst,
+            pending: AtomicUsize::new(1),
+            parent,
+            report: Arc::clone(report),
+        })
     }
+
+    /// Called once by the worker that processed this directory's task, and
+    /// once per subdirectory when its subtree completes.
+    fn done(&self) {
+        // Acquire pairs with the Release of the last child's registration,
+        // and the open sees every `mkdirat` the workers performed, because
+        // each of those happened-before the registration.
+        if self.pending.fetch_sub(1, AcqRel) == 1 {
+            // `NOFOLLOW` so a symlink swapped in at `dst` fails the open
+            // instead of being chmod-followed.
+            match openat(
+                CWD,
+                &self.dst,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    if let Err(e) = fchmod(&fd, self.mode) {
+                        self.report.fail(&self.dst, e);
+                    }
+                }
+                Err(e) => self.report.fail(&self.dst, e),
+            }
+            if let Some(p) = &self.parent {
+                p.done();
+            }
+        }
+    }
+}
+
+struct DirTask {
+    src: PathBuf,
+    node: Arc<DirNode>,
 }
 
 /// Work-stealing over directories: each worker drains its own deque, then steals
 /// from peers. Thousands of small files are latency-bound, so this is where the
 /// wall clock goes.
-fn walk(root: DirTask, report: &Report) {
+fn walk(root: DirTask, report: &Arc<Report>) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let injector = Injector::new();
     injector.push(root);
@@ -153,7 +239,6 @@ fn walk(root: DirTask, report: &Report) {
     }
 
     let injector = &injector;
-    let report = &report;
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(move || {
@@ -164,58 +249,66 @@ fn walk(root: DirTask, report: &Report) {
     });
 }
 
-fn run_worker(deque: &Worker<DirTask>, injector: &Injector<DirTask>, report: &Report) {
+fn run_worker(deque: &Worker<DirTask>, injector: &Injector<DirTask>, report: &Arc<Report>) {
     while let Some(task) = next_task(deque, injector) {
-        // `NOFOLLOW` throughout: the task hands out paths, so a directory that
-        // was swapped for a symlink between hand-off and open would otherwise
-        // be walked, and written through, somewhere else entirely.
-        let src_fd = match openat(
-            CWD,
-            &task.src,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(e) => {
-                report.fail(&task.src, e);
-                continue;
-            }
-        };
-        let dst_fd = match openat(
-            CWD,
-            &task.dst,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-            Mode::RWXU,
-        ) {
-            Ok(fd) => fd,
-            Err(e) => {
-                report.fail(&task.dst, e);
-                continue;
-            }
-        };
-        let mut dir = match Dir::read_from(&src_fd) {
-            Ok(dir) => dir,
-            Err(e) => {
-                report.fail(&task.src, e);
-                continue;
-            }
-        };
-        for entry in dir.by_ref() {
-            let Ok(entry) = entry else { continue };
-            let name = entry.file_name();
-            if name == c"." || name == c".." {
-                continue;
-            }
-            handle_entry(
-                &src_fd,
-                &dst_fd,
-                &task,
-                name,
-                entry.file_type(),
-                injector,
-                report,
-            );
+        process(&task, injector, report);
+        // This directory's own entry list is done; once every subdirectory it
+        // pushed is also done, `done` applies the source mode.
+        task.node.done();
+    }
+}
+
+fn process(task: &DirTask, injector: &Injector<DirTask>, report: &Arc<Report>) {
+    // `NOFOLLOW` throughout: the task hands out paths, so a directory that
+    // was swapped for a symlink between hand-off and open would otherwise
+    // be walked, and written through, somewhere else entirely. The
+    // destination fd is held only for this one iteration, never queued.
+    let src_fd = match openat(
+        CWD,
+        &task.src,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(e) => {
+            report.fail(&task.src, e);
+            return;
         }
+    };
+    let dst_fd = match openat(
+        CWD,
+        &task.node.dst,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(e) => {
+            report.fail(&task.node.dst, e);
+            return;
+        }
+    };
+    let mut dir = match Dir::read_from(&src_fd) {
+        Ok(dir) => dir,
+        Err(e) => {
+            report.fail(&task.src, e);
+            return;
+        }
+    };
+    for entry in dir.by_ref() {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        handle_entry(
+            &src_fd,
+            &dst_fd,
+            task,
+            name,
+            entry.file_type(),
+            injector,
+            report,
+        );
     }
 }
 
@@ -245,33 +338,13 @@ fn handle_entry(
     name: &CStr,
     file_type: FileType,
     injector: &Injector<DirTask>,
-    report: &Report,
+    report: &Arc<Report>,
 ) {
     let src_path = task.src.join(OsStr::from_bytes(name.to_bytes()));
-    let dst_path = task.dst.join(OsStr::from_bytes(name.to_bytes()));
+    let dst_path = task.node.dst.join(OsStr::from_bytes(name.to_bytes()));
 
-    if file_type == FileType::Directory {
-        if let Err(e) = mkdirat(dst_fd, name, Mode::RWXU)
-            && e != Errno::EXIST
-        {
-            report.fail(&src_path, e);
-            return;
-        }
-        if let Ok(st) = statat(src_fd, name, AtFlags::SYMLINK_NOFOLLOW)
-            && let Err(e) = chmodat(
-                dst_fd,
-                name,
-                Mode::from_raw_mode(st.st_mode),
-                AtFlags::empty(),
-            )
-        {
-            report.fail(&dst_path, e);
-        }
-        injector.push(DirTask::new(src_path, dst_path));
-        return;
-    }
-
-    // `d_type` is DT_UNKNOWN on some filesystems; fall back to a real stat.
+    // `d_type` is DT_UNKNOWN on some filesystems; fall back to a real stat so
+    // directories are recognised before the non-directory match below.
     let file_type = if file_type == FileType::Unknown {
         match statat(src_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) => FileType::from_raw_mode(st.st_mode),
@@ -283,6 +356,31 @@ fn handle_entry(
     } else {
         file_type
     };
+
+    if file_type == FileType::Directory {
+        if let Err(e) = mkdirat(dst_fd, name, Mode::RWXU)
+            && e != Errno::EXIST
+        {
+            report.fail(&src_path, e);
+            return;
+        }
+        let mode = match statat(src_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => Mode::from_raw_mode(st.st_mode),
+            Err(e) => {
+                report.fail(&src_path, e);
+                return;
+            }
+        };
+        // No fd here: the node is just a path and a counter, so a wide
+        // directory queues many tasks without touching the fd limit. The
+        // destination fd opens only when a worker processes the task.
+        let node = DirNode::new(mode, dst_path, Some(Arc::clone(&task.node)), report);
+        injector.push(DirTask {
+            src: src_path,
+            node,
+        });
+        return;
+    }
 
     let result = match file_type {
         FileType::Symlink => copy_symlink(src_fd, name, dst_fd, name),
@@ -481,7 +579,7 @@ pub fn remove_any(path: &Path) -> IoResult<()> {
 mod tests {
     use std::fs::{self, File};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{FileTypeExt, symlink};
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
 
     use super::*;
 
@@ -508,6 +606,23 @@ mod tests {
 
     impl Drop for Tmp {
         fn drop(&mut self) {
+            // Best effort: a test that intentionally made something read-only
+            // may leave the tree unresettable, so walk it and chmod dirs first.
+            fn reset(p: &Path) {
+                if let Ok(rd) = fs::read_dir(p) {
+                    for e in rd.flatten() {
+                        let child = e.path();
+                        if fs::symlink_metadata(&child)
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false)
+                        {
+                            reset(&child);
+                        }
+                    }
+                }
+                let _ = fs::set_permissions(p, fs::Permissions::from_mode(0o755));
+            }
+            reset(&self.0);
             let _ = fs::remove_dir_all(&self.0);
         }
     }
@@ -638,5 +753,101 @@ mod tests {
         assert!(copy_other_path(&tmp.path("nope"), &dst, FileType::Fifo).is_err());
 
         assert_eq!(fs::read(&dst).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn copy_tree_does_not_chmod_through_a_symlink() {
+        let tmp = Tmp::new("copy-nofollow");
+        fs::create_dir(tmp.path("src")).unwrap();
+        let victim = tmp.path("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o700)).unwrap();
+        // `dst` already exists as a symlink to `victim`, so `mkdirat` reports
+        // EEXIST and the eventual `fchmod` must not follow it.
+        symlink(&victim, tmp.path("dst")).unwrap();
+
+        let failures = copy_tree(&tmp.path("src"), &tmp.path("dst"));
+        assert!(
+            failures.iter().any(|f| f.path == tmp.path("dst")),
+            "the symlinked destination must be reported: {failures:?}"
+        );
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o700,
+        );
+    }
+
+    #[test]
+    fn copy_wide_directory_stays_under_the_fd_limit() {
+        // `RLIMIT_NOFILE` is per-process, so the lowered limit must live in a
+        // re-exec of this binary: dropping it in-process would break file
+        // opens of the other tests that run concurrently in this one.
+        if std::env::var_os("CB_WIDE_FDS_REEXEC").is_some() {
+            wide_fds_child();
+            return;
+        }
+        let bin = std::env::args().next().expect("test binary path");
+        let status = std::process::Command::new(&bin)
+            .env("CB_WIDE_FDS_REEXEC", "1")
+            .arg("--exact")
+            .arg("copy_wide_directory_stays_under_the_fd_limit")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the re-exec'd copy failed: {status}");
+    }
+
+    fn wide_fds_child() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+        let tmp = Tmp::new("wide-fds");
+        let src = tmp.path("src");
+        let dst = tmp.path("dst");
+        let dirs = 200u32;
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..dirs {
+            fs::create_dir(src.join(format!("d{i}"))).unwrap();
+        }
+
+        let old = getrlimit(Resource::Nofile);
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1) as u64;
+        // The walk holds a src and a dst fd per worker, plus the finalizers'
+        // brief opens; 200 queued children (the old behaviour) must breach
+        // the limit well below that.
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(3 + 3 * threads + 32),
+                maximum: old.maximum,
+            },
+        )
+        .unwrap();
+
+        let failures = copy_tree(&src, &dst);
+        assert!(failures.is_empty(), "{failures:?}");
+        let count = fs::read_dir(&dst).unwrap().count();
+        assert_eq!(count, usize::try_from(dirs).unwrap());
+    }
+
+    #[test]
+    fn copy_defers_read_only_directory_mode_until_children_exist() {
+        let tmp = Tmp::new("ro-dir");
+        let src = tmp.path("src");
+        let dst = tmp.path("dst");
+        fs::create_dir_all(src.join("ro")).unwrap();
+        fs::write(src.join("ro/child.txt"), b"hi").unwrap();
+        // 0o555 is readable and traversable but not writable: the destination
+        // copy must still be able to create `child.txt` inside `ro`.
+        fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let failures = copy_tree(&src, &dst);
+        // Restore the source so the guard's cleanup can walk it.
+        fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(fs::read(dst.join("ro/child.txt")).unwrap(), b"hi");
+        let mode = fs::metadata(dst.join("ro")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o555, "source mode must still be applied");
     }
 }
