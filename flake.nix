@@ -225,6 +225,7 @@
             checks = self.checks.${system};
 
             packages = [
+              pkgs.rust-analyzer
               pkgs.cargo-llvm-cov
               pkgs.zstd
               cargoDebugArtifacts
