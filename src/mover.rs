@@ -39,8 +39,23 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
             clear_destination(&dst)?;
             return renameat(CWD, src, CWD, &dst).map(|()| Outcome::Moved);
         }
-        // Cross-device or no `renameat2`: fall back to copy-then-delete.
-        Err(Errno::XDEV | Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => {}
+        // Cross-device, or no `renameat2`: fall back to copy-then-delete.
+        Err(Errno::XDEV | Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => {
+            // The copy truncates whatever it finds, so the policy has to be
+            // consulted here too, not only on the `EXIST` answer from above.
+            //
+            // ponytail: the check and the copy are not atomic together, so a
+            // destination created in between is still overwritten. A tree
+            // cannot be created exclusively in one step. Upgrade path: build
+            // into a private directory and `renameat` it over the destination
+            // once it is complete.
+            if exists(&dst)? {
+                if !policy.resolve(&dst)? {
+                    return Ok(Outcome::Skipped);
+                }
+                clear_destination(&dst)?;
+            }
+        }
         Err(e) => return Err(e),
     }
 
@@ -75,15 +90,29 @@ fn rename_noreplace(src: &Path, dst: &Path) -> IoResult<()> {
     }
 }
 
+/// Whether `path` is taken, without following a final symlink. `Path::exists`
+/// follows it, so a dangling link reads as free and gets overwritten.
+pub fn exists(path: &Path) -> IoResult<bool> {
+    match statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Empty `dst` when it is a directory. Plain `rename` will not overwrite a
+/// non-empty one.
 fn clear_destination(dst: &Path) -> IoResult<()> {
     let st = statat(CWD, dst, AtFlags::SYMLINK_NOFOLLOW)?;
     if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::Directory {
         return Ok(());
     }
+    // `NOFOLLOW`: the `statat` above named a directory, and a symlink swapped in
+    // between must fail the open rather than empty whatever it points at.
     let dir_fd = rustix::fs::openat(
         CWD,
         dst,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
     )?;
     let mut dir = rustix::fs::Dir::read_from(&dir_fd)?;
@@ -251,6 +280,16 @@ mod tests {
 
         assert_eq!(fs::read(&dst).unwrap(), b"new");
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn exists_counts_a_dangling_symlink_as_taken() {
+        let tmp = Tmp::new("exists-symlink");
+        std::os::unix::fs::symlink("missing", tmp.0.join("l")).unwrap();
+
+        assert!(exists(&tmp.0.join("l")).unwrap());
+        assert!(!exists(&tmp.0.join("nope")).unwrap());
+        assert!(!Path::new(&tmp.0.join("l")).exists());
     }
 
     #[test]

@@ -1,13 +1,14 @@
-use std::ffi::{CStr, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 use crossbeam_deque::{Injector, Steal, Worker};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, CWD, Dir, FileType, Mode, OFlags, chmodat, mkdirat, openat, readlinkat, statat,
-    symlinkat, unlinkat,
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, chmodat, mkdirat, openat, readlinkat, renameat,
+    statat, symlinkat, unlinkat,
 };
 use rustix::io::{Errno, Result as IoResult};
 
@@ -145,10 +146,13 @@ fn walk(root: DirTask, report: &Report) {
 
 fn run_worker(deque: &Worker<DirTask>, injector: &Injector<DirTask>, report: &Report) {
     while let Some(task) = next_task(deque, injector) {
+        // `NOFOLLOW` throughout: the task hands out paths, so a directory that
+        // was swapped for a symlink between hand-off and open would otherwise
+        // be walked, and written through, somewhere else entirely.
         let src_fd = match openat(
             CWD,
             &task.src,
-            OFlags::RDONLY | OFlags::DIRECTORY,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
@@ -160,7 +164,7 @@ fn run_worker(deque: &Worker<DirTask>, injector: &Injector<DirTask>, report: &Re
         let dst_fd = match openat(
             CWD,
             &task.dst,
-            OFlags::RDONLY | OFlags::DIRECTORY,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
             Mode::RWXU,
         ) {
             Ok(fd) => fd,
@@ -264,22 +268,81 @@ fn handle_entry(
         FileType::Symlink => copy_symlink(src_fd, name, dst_fd, name),
         FileType::RegularFile => copy_regular(src_fd, name, dst_fd, name),
         other => match statat(src_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) => {
-                let _ = unlinkat(dst_fd, name, AtFlags::empty());
+            Ok(st) => replace_entry(dst_fd, name, |tmp| {
                 mknodat(
                     dst_fd,
-                    name,
+                    tmp,
                     other,
                     Mode::from_raw_mode(st.st_mode),
                     st.st_rdev,
                 )
-            }
+            }),
             Err(e) => Err(e),
         },
     };
     if let Err(e) = result {
         report.fail(&src_path, e);
     }
+}
+
+/// Create `dst_name` under a private name and `renameat` it into place.
+///
+/// Unlinking first leaves a window in which a competing writer's file is gone
+/// and nothing has taken its place, so a lost race destroys the destination
+/// rather than replacing it. `renameat` replaces atomically, and the temporary
+/// is cleaned up on both failure paths.
+fn replace_entry<F>(dst_dir: &OwnedFd, dst_name: &CStr, create: F) -> IoResult<()>
+where
+    F: FnOnce(&CStr) -> IoResult<()>,
+{
+    let tmp = temp_name(dst_name);
+    if let Err(e) = create(&tmp) {
+        let _ = unlinkat(dst_dir, &tmp, AtFlags::empty());
+        return Err(e);
+    }
+    match renameat(dst_dir, &tmp, dst_dir, dst_name) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = unlinkat(dst_dir, &tmp, AtFlags::empty());
+            Err(e)
+        }
+    }
+}
+
+/// `replace_entry` for a whole path, where the temporary lands beside it so the
+/// rename stays on one filesystem.
+fn replace_entry_path<F>(dst: &Path, create: F) -> IoResult<()>
+where
+    F: FnOnce(&Path) -> IoResult<()>,
+{
+    let name = dst.file_name().ok_or(Errno::INVAL)?;
+    let tmp = dst.with_file_name(OsStr::from_bytes(&temp_bytes(name.as_bytes())));
+    if let Err(e) = create(&tmp) {
+        let _ = rustix::fs::unlink(&tmp);
+        return Err(e);
+    }
+    match rustix::fs::rename(&tmp, dst) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = rustix::fs::unlink(&tmp);
+            Err(e)
+        }
+    }
+}
+
+static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Private enough that another `cb` will not collide: the pid, plus a counter
+/// for the many temporaries one process creates under one directory fd.
+fn temp_name(dst_name: &CStr) -> CString {
+    CString::new(temp_bytes(dst_name.to_bytes())).unwrap_or_else(|_| c".cb-tmp".to_owned())
+}
+
+fn temp_bytes(dst_name: &[u8]) -> Vec<u8> {
+    let n = TEMP_SEQ.fetch_add(1, Relaxed);
+    let mut bytes = format!(".cb-tmp.{}.{n}.", std::process::id()).into_bytes();
+    bytes.extend_from_slice(dst_name);
+    bytes
 }
 
 fn copy_regular(
@@ -314,16 +377,16 @@ fn copy_symlink(
     dst_name: &CStr,
 ) -> IoResult<()> {
     let target = readlinkat(src_dir, src_name, Vec::new())?;
-    let _ = unlinkat(dst_dir, dst_name, AtFlags::empty());
-    symlinkat(target.as_bytes(), dst_dir, dst_name)
+    replace_entry(dst_dir, dst_name, |tmp| {
+        symlinkat(target.as_bytes(), dst_dir, tmp)
+    })
 }
 
 /// Top-level entry points: whole paths rather than names under an open
 /// directory fd, which is what the recursive worker passes around.
 fn copy_symlink_path(src: &Path, dst: &Path) -> IoResult<()> {
     let target = rustix::fs::readlink(src, Vec::new())?;
-    let _ = rustix::fs::unlink(dst);
-    rustix::fs::symlink(target.as_bytes(), dst)
+    replace_entry_path(dst, |tmp| rustix::fs::symlink(target.as_bytes(), tmp))
 }
 
 fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
@@ -340,14 +403,15 @@ fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
 
 fn copy_other_path(src: &Path, dst: &Path, file_type: FileType) -> IoResult<()> {
     let st = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW)?;
-    let _ = rustix::fs::unlink(dst);
-    mknodat(
-        CWD,
-        dst,
-        file_type,
-        Mode::from_raw_mode(st.st_mode),
-        st.st_rdev,
-    )
+    replace_entry_path(dst, |tmp| {
+        mknodat(
+            CWD,
+            tmp,
+            file_type,
+            Mode::from_raw_mode(st.st_mode),
+            st.st_rdev,
+        )
+    })
 }
 
 /// Remove a tree bottom-up. Only used to finish a move that `renameat2` could
@@ -361,7 +425,15 @@ pub fn remove_any(path: &Path) -> IoResult<()> {
     if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
         return unlinkat(CWD, path, AtFlags::empty());
     }
-    let dir_fd = openat(CWD, path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())?;
+    // `NOFOLLOW`: the `statat` above named a directory, and a symlink swapped in
+    // between must fail the open rather than send the recursive delete into
+    // whatever it points at.
+    let dir_fd = openat(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
     let mut dir = Dir::read_from(&dir_fd)?;
     let mut children = Vec::new();
     for entry in dir.by_ref() {
@@ -441,6 +513,40 @@ mod tests {
         copy_symlink(&src_dir, c"l", &dst_dir, c"l").unwrap();
 
         assert_eq!(fs::read_link(tmp.path("dst/l")).unwrap(), Path::new("new"));
+    }
+
+    #[test]
+    fn replace_entry_keeps_the_destination_when_the_create_fails() {
+        let tmp = Tmp::new("replace-fail");
+        let dir = tmp.subdir("dst");
+        fs::write(tmp.path("dst/l"), b"old").unwrap();
+
+        assert_eq!(
+            replace_entry(&dir, c"l", |_| Err(Errno::PERM)),
+            Err(Errno::PERM)
+        );
+        assert_eq!(fs::read(tmp.path("dst/l")).unwrap(), b"old");
+        assert_eq!(
+            fs::read_dir(tmp.path("dst")).unwrap().count(),
+            1,
+            "no temporary may be left behind"
+        );
+    }
+
+    #[test]
+    fn remove_any_unlinks_a_symlinked_directory_rather_than_its_target() {
+        let tmp = Tmp::new("rm-symlink");
+        fs::create_dir(tmp.path("real")).unwrap();
+        fs::write(tmp.path("real/keep.txt"), b"keep").unwrap();
+        symlink(tmp.path("real"), tmp.path("link")).unwrap();
+
+        remove_any(&tmp.path("link")).unwrap();
+
+        assert!(fs::symlink_metadata(tmp.path("link")).is_err());
+        assert!(
+            tmp.path("real/keep.txt").exists(),
+            "the link target must survive"
+        );
     }
 
     #[test]

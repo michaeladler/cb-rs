@@ -232,6 +232,29 @@ fn a_move_across_devices_copies_verifies_then_deletes() {
     let _ = fs::remove_dir_all(&xdev);
 }
 
+/// The cross-device copy truncates whatever sits at the destination, so the
+/// policy has to be asked there too. Without this the default `skip` is honoured
+/// only on the same-filesystem path.
+#[test]
+fn a_move_across_devices_skips_an_existing_destination() {
+    let Some(xdev) = other_device_dir() else {
+        eprintln!("skipping: no second filesystem (set CB_TESTVOL_DIR)");
+        return;
+    };
+    let sandbox = Sandbox::new("xdev-policy");
+    let src = sandbox.write("file.txt", b"source");
+    let dst_dir = xdev.join("policy-dst");
+    fs::create_dir_all(&dst_dir).unwrap();
+    fs::write(dst_dir.join("file.txt"), b"existing").unwrap();
+
+    let outcome = move_into(&src, &dst_dir, Policy::Skip).unwrap();
+
+    assert!(matches!(outcome, Outcome::Skipped));
+    assert_eq!(fs::read(dst_dir.join("file.txt")).unwrap(), b"existing");
+    assert_eq!(fs::read(&src).unwrap(), b"source");
+    let _ = fs::remove_dir_all(&xdev);
+}
+
 #[test]
 fn move_skips_an_existing_destination_by_default() {
     let sandbox = Sandbox::new("move-skip");

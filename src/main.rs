@@ -257,6 +257,8 @@ fn record(
         }
     }
 
+    // Guards the reset, the amend and the write below as one step.
+    let _lock = clipboard.lock().map_err(|e| e.to_string())?;
     let mut list = if amend {
         clipboard.read_list(&file)
     } else {
@@ -296,6 +298,10 @@ fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(),
     if let Err(e) = std::fs::create_dir_all(dst_dir) {
         return Err(format!("{}: {e}", dst_dir.display()));
     }
+    // A move consumes the clipboard, so its read-modify-write spans the whole
+    // paste and holds the lock; a concurrent `cut` would otherwise be undone by
+    // the rewrite at the end.
+    let _lock = clipboard.lock().map_err(|e| e.to_string())?;
     let moves = clipboard.read_list(&clipboard.originals());
     let copies = clipboard.read_list(&clipboard.copies());
     let mut result = Ok(());
@@ -366,7 +372,11 @@ fn paste_copies(dst_dir: &Path, policy: Policy, sources: &[PathBuf]) -> Result<(
             continue;
         };
         let dst = dst_dir.join(name);
-        if dst.exists() && !policy.resolve(&dst).map_err(|e| e.to_string())? {
+        // `mover::exists` rather than `Path::exists`, which follows symlinks and
+        // so reports a dangling one as free, then overwrites it.
+        if mover::exists(&dst).map_err(|e| e.to_string())?
+            && !policy.resolve(&dst).map_err(|e| e.to_string())?
+        {
             skipped += 1;
             continue;
         }

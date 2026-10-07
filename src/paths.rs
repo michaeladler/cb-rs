@@ -1,6 +1,9 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use rustix::fd::OwnedFd;
+use rustix::fs::{FlockOperation, Mode, OFlags, flock};
+
 pub const DEFAULT_NAME: &str = "0";
 /// Own state directory, deliberately not the C++ `cb`'s `clipboard/`: sharing it
 /// means a `cut` here wipes the other tool's staged bytes, since a new cut
@@ -9,6 +12,7 @@ pub const STATE_DIR: &str = "cb-rs";
 const METADATA: &str = "metadata";
 const ORIGINALS: &str = "originals";
 const COPIES: &str = "copies";
+const LOCK: &str = "lock";
 
 /// `originals` holds what `paste` moves and `copies` what it copies; neither
 /// holds bytes, because neither `cut` nor `copy` reads a file, so nothing is
@@ -45,6 +49,23 @@ impl Clipboard {
         self.ensure()
     }
 
+    /// Hold this for a whole read-modify-write of the recorded lists: two `cb`
+    /// processes that both read, both append and both write otherwise lose one
+    /// another's paths. The kernel drops the lock when the process dies, so a
+    /// crash cannot wedge the clipboard.
+    ///
+    /// ponytail: a paste holds this for its whole duration, so a long copy
+    /// blocks a concurrent `cb cut` outright. Upgrade path: claim each source
+    /// path with `linkat` into a private holding directory, so the clipboard
+    /// lock covers only the list bookkeeping.
+    pub fn lock(&self) -> std::io::Result<OwnedFd> {
+        self.ensure()?;
+        let file = self.root.join(METADATA).join(LOCK);
+        let fd = rustix::fs::open(&file, OFlags::RDWR | OFlags::CREATE, Mode::RWXU)?;
+        flock(&fd, FlockOperation::LockExclusive)?;
+        Ok(fd)
+    }
+
     pub fn read_list(&self, file: &Path) -> Vec<PathBuf> {
         let Ok(contents) = std::fs::read_to_string(file) else {
             return Vec::new();
@@ -54,6 +75,10 @@ impl Clipboard {
 
     /// An empty list removes the file, so a consumed clipboard leaves nothing
     /// behind for the next read.
+    ///
+    /// Callers hold [`Self::lock`]. The write still goes to a temporary that is
+    /// renamed over the target, so a reader that ignores the lock still sees
+    /// either the whole old list or the whole new one, never half of either.
     pub fn write_list(&self, file: &Path, paths: &[PathBuf]) -> std::io::Result<()> {
         if paths.is_empty() {
             let _ = std::fs::remove_file(file);
@@ -65,7 +90,9 @@ impl Clipboard {
             text.push_str(&path.to_string_lossy());
             text.push('\n');
         }
-        std::fs::write(file, text)
+        let tmp = file.with_extension("new");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, file)
     }
 }
 
@@ -81,4 +108,74 @@ fn state_root() -> PathBuf {
 
 fn home() -> PathBuf {
     env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("cb-paths-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn clipboard(&self) -> Clipboard {
+            Clipboard {
+                root: self.0.join("0"),
+            }
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_lock_excludes_a_second_holder() {
+        let tmp = Tmp::new("lock");
+        let held = tmp.clipboard().lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let root = tmp.clipboard().root;
+        std::thread::spawn(move || {
+            let _second = Clipboard { root }.lock().unwrap();
+            tx.send(()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a second lock must wait while the first is held"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the lock must be released when it is dropped");
+    }
+
+    #[test]
+    fn write_list_leaves_no_temporary_behind() {
+        let tmp = Tmp::new("write");
+        let clipboard = tmp.clipboard();
+        let file = clipboard.originals();
+        let paths = vec![PathBuf::from("/one"), PathBuf::from("/two")];
+
+        clipboard.write_list(&file, &paths).unwrap();
+
+        assert_eq!(clipboard.read_list(&file), paths);
+        let left: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n != "lock")
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("originals")]);
+    }
 }
