@@ -20,9 +20,10 @@ use rustix::fs::mknodat;
 /// cannot be recreated from an open directory fd. Report it like any other
 /// failure rather than dropping the entry silently.
 ///
-/// ponytail: macOS copies of trees with special files lose those entries.
-/// Upgrade path: `mkfifoat` where the kernel has it, `clonefile`/`fcopyfile`
-/// for the reflink rung, and a libc `mknod` on the full path for the rest.
+/// ponytail: a macOS paste of a tree holding a fifo or device node fails that
+/// entry, and a cut of one fails outright with the source left in place. Fix:
+/// `libc::mknod` on the path `rustix::fs::getpath` returns for `dirfd`, behind a
+/// target-scoped `libc` dependency.
 #[cfg(target_vendor = "apple")]
 fn mknodat<P: rustix::path::Arg, Fd: rustix::fd::AsFd>(
     _dirfd: Fd,
@@ -343,6 +344,13 @@ fn temp_bytes(dst_name: &[u8]) -> Vec<u8> {
     let mut bytes = format!(".cb-tmp.{}.{n}.", std::process::id()).into_bytes();
     bytes.extend_from_slice(dst_name);
     bytes
+}
+
+/// A private sibling of `path`, on the same filesystem so a rename from it
+/// stays atomic. Each call names a different file.
+pub fn staged_path(path: &Path) -> IoResult<PathBuf> {
+    let name = path.file_name().ok_or(Errno::INVAL)?;
+    Ok(path.with_file_name(OsStr::from_bytes(&temp_bytes(name.as_bytes()))))
 }
 
 fn copy_regular(

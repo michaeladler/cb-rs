@@ -11,6 +11,7 @@ use crate::policy::Policy;
 use crate::walk;
 
 /// What became of one move attempt.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Moved,
     /// Destination exists and policy said leave it alone.
@@ -19,10 +20,10 @@ pub enum Outcome {
 
 /// Move `src` to `dst_dir/<basename>`.
 ///
-/// Same filesystem: one `renameat2`. Different filesystems: copy, verify the
-/// destination is on disk, and only then unlink the source. The C++ version
-/// deletes originals after a copy it never re-checked, which loses data if the
-/// copy silently came up short.
+/// Same filesystem: one `renameat2`. Different filesystems: copy to a private
+/// staging path, rename that onto the destination, and only then unlink the
+/// source. The C++ version deletes originals after a copy it never re-checked,
+/// which loses data if the copy silently came up short.
 pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome> {
     let name = src.file_name().ok_or(Errno::INVAL)?;
     let dst = dst_dir.join(name);
@@ -40,30 +41,45 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
             return renameat(CWD, src, CWD, &dst).map(|()| Outcome::Moved);
         }
         // Cross-device, or no `renameat2`: fall back to copy-then-delete.
-        Err(Errno::XDEV | Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => {
-            // The copy truncates whatever it finds, so the policy has to be
-            // consulted here too, not only on the `EXIST` answer from above.
-            //
-            // ponytail: the check and the copy are not atomic together, so a
-            // destination created in between is still overwritten. A tree
-            // cannot be created exclusively in one step. Upgrade path: build
-            // into a private directory and `renameat` it over the destination
-            // once it is complete.
-            if exists(&dst)? {
-                if !policy.resolve(&dst)? {
-                    return Ok(Outcome::Skipped);
-                }
-                clear_destination(&dst)?;
-            }
-        }
+        Err(Errno::XDEV | Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => {}
         Err(e) => return Err(e),
     }
 
-    let failures = walk::copy_any(src, &dst);
+    // A cross-device move copies into a private sibling of the destination and
+    // renames that into place, so a destination that appears while the copy
+    // runs is only ever replaced by a finished tree.
+    let staged = walk::staged_path(&dst)?;
+    stage_and_commit(src, &dst, &staged, policy)
+}
+
+/// Copy `src` to `staged`, then move it onto `dst`. The source is unlinked only
+/// after the destination is on disk. A staged tree that did not reach the
+/// destination is removed here rather than by the caller, which cannot tell
+/// which outcome it got before looking.
+fn stage_and_commit(src: &Path, dst: &Path, staged: &Path, policy: Policy) -> IoResult<Outcome> {
+    let result = copy_then_commit(src, dst, staged, policy);
+    if !matches!(result, Ok(Outcome::Moved)) {
+        let _ = walk::remove_any(staged);
+    }
+    result
+}
+
+fn copy_then_commit(src: &Path, dst: &Path, staged: &Path, policy: Policy) -> IoResult<Outcome> {
+    let failures = walk::copy_any(src, staged);
     if !failures.is_empty() {
         return Err(Errno::IO);
     }
-    sync_path(&dst)?;
+    // Re-read rather than trusting the answer from above the copy: the staged
+    // tree went in under a private name, so only now does it overwrite.
+    if exists(dst)? && !policy.resolve(dst)? {
+        return Ok(Outcome::Skipped);
+    }
+    // Plain `rename` will not overwrite a non-empty directory, so one that is
+    // still there has to go aside first. Two renames, so a competing writer can
+    // still land between them; nothing here is a single atomic step.
+    clear_destination(dst)?;
+    rustix::fs::rename(staged, dst)?;
+    sync_path(dst)?;
     walk::remove_any(src)?;
     Ok(Outcome::Moved)
 }
@@ -181,6 +197,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use crate::policy::Policy;
+
     use super::*;
 
     struct Tmp(PathBuf);
@@ -290,6 +308,77 @@ mod tests {
         assert!(exists(&tmp.0.join("l")).unwrap());
         assert!(!exists(&tmp.0.join("nope")).unwrap());
         assert!(!Path::new(&tmp.0.join("l")).exists());
+    }
+
+    #[test]
+    fn stage_and_commit_keeps_the_destination_when_the_policy_declines() {
+        let tmp = Tmp::new("stage-decline");
+        let src = tmp.0.join("src");
+        let dst = tmp.0.join("dst");
+        let staged = walk::staged_path(&dst).unwrap();
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        assert_eq!(
+            stage_and_commit(&src, &dst, &staged, Policy::Skip),
+            Ok(Outcome::Skipped)
+        );
+
+        assert_eq!(fs::read(&dst).unwrap(), b"old");
+        assert_eq!(
+            fs::read(&src).unwrap(),
+            b"new",
+            "a decline must not consume the source"
+        );
+        assert!(
+            !staged.exists(),
+            "the staged copy must not survive a declined commit"
+        );
+    }
+
+    #[test]
+    fn stage_and_commit_replaces_a_directory_and_consumes_the_source() {
+        let tmp = Tmp::new("stage-commit");
+        let src = tmp.0.join("src");
+        let dst = tmp.0.join("dst");
+        let staged = walk::staged_path(&dst).unwrap();
+        fs::create_dir(&src).unwrap();
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("nested/f"), b"new").unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(dst.join("stale"), b"old").unwrap();
+
+        assert_eq!(
+            stage_and_commit(&src, &dst, &staged, Policy::Replace),
+            Ok(Outcome::Moved)
+        );
+
+        assert_eq!(fs::read(dst.join("nested/f")).unwrap(), b"new");
+        assert!(!dst.join("stale").exists(), "the old contents must be gone");
+        assert!(!src.exists(), "the source is consumed after the commit");
+        assert!(!staged.exists(), "the staging path must not survive");
+        assert_eq!(
+            fs::read_dir(&tmp.0).unwrap().count(),
+            1,
+            "no staging leftovers in the destination directory"
+        );
+    }
+
+    #[test]
+    fn staged_path_is_a_private_sibling_that_differs_per_call() {
+        let dst = Path::new("/tmp/dst");
+        let a = walk::staged_path(dst).unwrap();
+        let b = walk::staged_path(dst).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), dst.parent(), "must stay on the same filesystem");
+        assert!(
+            a.file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b".cb-tmp."),
+            "got {:?}",
+            a.file_name().unwrap()
+        );
     }
 
     #[test]

@@ -54,10 +54,10 @@ impl Clipboard {
     /// another's paths. The kernel drops the lock when the process dies, so a
     /// crash cannot wedge the clipboard.
     ///
-    /// ponytail: a paste holds this for its whole duration, so a long copy
-    /// blocks a concurrent `cb cut` outright. Upgrade path: claim each source
-    /// path with `linkat` into a private holding directory, so the clipboard
-    /// lock covers only the list bookkeeping.
+    /// Held only for the bookkeeping, never across a copy: the work that
+    /// follows a paste is slow, and holding this through it would block every
+    /// other `cb` command. A paste that released the lock uses
+    /// [`Self::consume`] to write its result back instead.
     pub fn lock(&self) -> std::io::Result<OwnedFd> {
         self.ensure()?;
         let file = self.root.join(METADATA).join(LOCK);
@@ -93,6 +93,27 @@ impl Clipboard {
         let tmp = file.with_extension("new");
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, file)
+    }
+
+    /// Replace `file` with `remaining` only if it still holds exactly `expected`.
+    /// Returns whether the write happened.
+    ///
+    /// A paste does its slow work with the lock released, so the list may have
+    /// moved on by the time it wants to record what it consumed. Writing then
+    /// would discard a `cut` recorded in between; refusing leaves the newer
+    /// entry alone and costs the caller a retry.
+    pub fn consume(
+        &self,
+        file: &Path,
+        expected: &[PathBuf],
+        remaining: &[PathBuf],
+    ) -> std::io::Result<bool> {
+        let _lock = self.lock()?;
+        if self.read_list(file) != expected {
+            return Ok(false);
+        }
+        self.write_list(file, remaining)?;
+        Ok(true)
     }
 }
 
@@ -177,5 +198,42 @@ mod tests {
             .filter(|n| n != "lock")
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("originals")]);
+    }
+
+    #[test]
+    fn consume_writes_when_the_list_is_unchanged() {
+        let tmp = Tmp::new("consume-match");
+        let clipboard = tmp.clipboard();
+        let file = clipboard.originals();
+        let expected = vec![PathBuf::from("/one"), PathBuf::from("/two")];
+        clipboard.write_list(&file, &expected).unwrap();
+
+        assert!(
+            clipboard
+                .consume(&file, &expected, &[expected[0].clone()])
+                .unwrap()
+        );
+
+        assert_eq!(clipboard.read_list(&file), vec![PathBuf::from("/one")]);
+    }
+
+    #[test]
+    fn consume_refuses_when_another_process_recorded_a_path() {
+        let tmp = Tmp::new("consume-clobber");
+        let clipboard = tmp.clipboard();
+        let file = clipboard.originals();
+        let expected = vec![PathBuf::from("/one")];
+        clipboard.write_list(&file, &expected).unwrap();
+        // Another `cb` records a path after the paste read its snapshot.
+        clipboard
+            .write_list(&file, &[PathBuf::from("/one"), PathBuf::from("/fresh")])
+            .unwrap();
+
+        assert!(!clipboard.consume(&file, &expected, &[]).unwrap());
+
+        assert!(
+            clipboard.read_list(&file) == vec![PathBuf::from("/one"), PathBuf::from("/fresh")],
+            "a concurrent cut must survive the paste's rewrite"
+        );
     }
 }

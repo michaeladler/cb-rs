@@ -298,12 +298,17 @@ fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(),
     if let Err(e) = std::fs::create_dir_all(dst_dir) {
         return Err(format!("{}: {e}", dst_dir.display()));
     }
-    // A move consumes the clipboard, so its read-modify-write spans the whole
-    // paste and holds the lock; a concurrent `cut` would otherwise be undone by
-    // the rewrite at the end.
-    let _lock = clipboard.lock().map_err(|e| e.to_string())?;
-    let moves = clipboard.read_list(&clipboard.originals());
-    let copies = clipboard.read_list(&clipboard.copies());
+    // The lock covers only reading the lists. Holding it across the paste would
+    // block every other `cb` command for the length of the copy; the rewrite
+    // that consumes a move goes through `Clipboard::consume`, which takes the
+    // lock again and refuses if another process recorded something in between.
+    let (moves, copies) = {
+        let _lock = clipboard.lock().map_err(|e| e.to_string())?;
+        (
+            clipboard.read_list(&clipboard.originals()),
+            clipboard.read_list(&clipboard.copies()),
+        )
+    };
     let mut result = Ok(());
     if !moves.is_empty() {
         result = paste_moves(clipboard, dst_dir, policy, &moves);
@@ -342,9 +347,11 @@ fn paste_moves(
             }
         }
     }
-    clipboard
-        .write_list(&clipboard.originals(), &remaining)
-        .map_err(|e| e.to_string())?;
+    match clipboard.consume(&clipboard.originals(), sources, &remaining) {
+        Ok(true) => {}
+        Ok(false) => eprintln!("cb: clipboard changed during paste, leaving it alone"),
+        Err(e) => return Err(e.to_string()),
+    }
     if skipped > 0 {
         println!("skipped {skipped} existing item(s)");
     }
