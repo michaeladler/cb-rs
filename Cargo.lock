@@ -46,6 +46,7 @@ dependencies = [
  "argh",
  "crossbeam-deque",
  "indicatif",
+ "libc",
  "rustix",
 ]
 

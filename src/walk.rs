@@ -16,23 +16,42 @@ use rustix::io::{Errno, Result as IoResult};
 use rustix::fs::mknodat;
 
 /// macOS has no `mknodat` — it was never taken up by the BSDs — and rustix
-/// ships no path-based `mknod` to fall back on, so a fifo or device node
-/// cannot be recreated from an open directory fd. Report it like any other
-/// failure rather than dropping the entry silently.
-///
-/// ponytail: a macOS paste of a tree holding a fifo or device node fails that
-/// entry, and a cut of one fails outright with the source left in place. Fix:
-/// `libc::mknod` on the path `rustix::fs::getpath` returns for `dirfd`, behind a
-/// target-scoped `libc` dependency.
+/// ships no path-based `mknod` to fall back on, so go through libc's `mknod`
+/// on a path. `getpath` recovers the directory an fd names, which is what the
+/// path has to be relative to.
 #[cfg(target_vendor = "apple")]
 fn mknodat<P: rustix::path::Arg, Fd: rustix::fd::AsFd>(
-    _dirfd: Fd,
-    _path: P,
-    _file_type: FileType,
-    _mode: Mode,
-    _dev: rustix::fs::Dev,
+    dirfd: Fd,
+    path: P,
+    file_type: FileType,
+    mode: Mode,
+    dev: rustix::fs::Dev,
 ) -> IoResult<()> {
-    Err(Errno::PERM)
+    use std::os::fd::{AsFd, AsRawFd};
+
+    // `CWD` is not a real fd, so `getpath` cannot name it; the process working
+    // directory is the directory it stands for.
+    let dir = if dirfd.as_fd().as_raw_fd() == CWD.as_fd().as_raw_fd() {
+        let cwd = std::env::current_dir().map_err(|_| Errno::IO)?;
+        cwd.into_os_string().into_encoded_bytes()
+    } else {
+        rustix::fs::getpath(dirfd)?.into_bytes()
+    };
+
+    path.into_with_c_str(|path| {
+        let mut full = dir.clone();
+        full.push(b'/');
+        full.extend_from_slice(path.to_bytes());
+        let Ok(full) = CString::new(full) else {
+            return Err(Errno::INVAL);
+        };
+        // SAFETY: `full` is NUL-terminated and outlives the call.
+        if unsafe { libc::mknod(full.as_ptr(), mode.bits() | file_type.as_raw_mode(), dev) } == 0 {
+            Ok(())
+        } else {
+            Err(Errno::from_raw_os_error(unsafe { *libc::__error() }))
+        }
+    })
 }
 
 use crate::copy;
@@ -462,9 +481,7 @@ pub fn remove_any(path: &Path) -> IoResult<()> {
 mod tests {
     use std::fs::{self, File};
     use std::os::unix::ffi::OsStrExt;
-    #[cfg(not(target_vendor = "apple"))]
-    use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{FileTypeExt, symlink};
 
     use super::*;
 
@@ -580,7 +597,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn copy_other_path_recreates_fifo() {
         let tmp = Tmp::new("fifo");
@@ -592,7 +608,6 @@ mod tests {
         assert!(fs::symlink_metadata(&dst).unwrap().file_type().is_fifo());
     }
 
-    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn copy_other_path_replaces_existing_destination() {
         let tmp = Tmp::new("fifo-replace");
@@ -614,7 +629,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn copy_other_path_missing_source_keeps_destination() {
         let tmp = Tmp::new("other-keep");
