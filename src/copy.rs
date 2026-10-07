@@ -182,3 +182,166 @@ pub enum Method {
     CopyFileRange,
     Stream,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File, OpenOptions};
+    use std::path::PathBuf;
+
+    use super::*;
+
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            Self(std::env::temp_dir().join(format!("cb-copy-{name}-{}", std::process::id())))
+        }
+
+        fn open(&self) -> OwnedFd {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&self.0)
+                .unwrap()
+                .into()
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn stream_roundtrip(name: &str, len: usize) {
+        let (src_tmp, dst_tmp) = (
+            Tmp::new(&format!("{name}-src")),
+            Tmp::new(&format!("{name}-dst")),
+        );
+        let data = pattern(len);
+        fs::write(&src_tmp.0, &data).unwrap();
+        let src: OwnedFd = File::open(&src_tmp.0).unwrap().into();
+        let dst = dst_tmp.open();
+
+        copy_stream(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst_tmp.0).unwrap(), data);
+    }
+
+    #[test]
+    fn copy_stream_empty() {
+        stream_roundtrip("empty", 0);
+    }
+
+    #[test]
+    fn copy_stream_smaller_than_chunk() {
+        stream_roundtrip("small", 1000);
+    }
+
+    #[test]
+    fn copy_stream_exactly_one_chunk() {
+        stream_roundtrip("one-chunk", CHUNK);
+    }
+
+    #[test]
+    fn copy_stream_one_byte_over_chunk() {
+        stream_roundtrip("chunk-plus-one", CHUNK + 1);
+    }
+
+    #[test]
+    fn copy_stream_exact_multiple_of_chunk() {
+        stream_roundtrip("two-chunks", 2 * CHUNK);
+    }
+
+    #[test]
+    fn copy_stream_many_chunks_with_tail() {
+        stream_roundtrip("many", 3 * CHUNK + 17);
+    }
+
+    #[test]
+    fn copy_stream_read_error_propagates() {
+        let tmp = Tmp::new("read-err");
+        let dst = tmp.open();
+        let write_only: OwnedFd = OpenOptions::new().write(true).open(&tmp.0).unwrap().into();
+        assert!(copy_stream(&write_only, &dst).is_err());
+    }
+
+    #[test]
+    fn write_all_writes_whole_buffer() {
+        let tmp = Tmp::new("write-all");
+        let dst = tmp.open();
+        let data = pattern(3 * CHUNK + 5);
+
+        write_all(&dst, &data).unwrap();
+
+        assert_eq!(fs::read(&tmp.0).unwrap(), data);
+    }
+
+    #[test]
+    fn write_all_appends_across_calls() {
+        let tmp = Tmp::new("write-all-twice");
+        let dst = tmp.open();
+
+        write_all(&dst, b"foo").unwrap();
+        write_all(&dst, b"bar").unwrap();
+
+        assert_eq!(fs::read(&tmp.0).unwrap(), b"foobar");
+    }
+
+    #[test]
+    fn write_all_empty_buffer_is_noop() {
+        let tmp = Tmp::new("write-all-empty");
+        let dst = tmp.open();
+
+        write_all(&dst, &[]).unwrap();
+
+        assert!(fs::read(&tmp.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_all_propagates_error() {
+        let tmp = Tmp::new("write-all-ro");
+        drop(tmp.open());
+        let read_only: OwnedFd = File::open(&tmp.0).unwrap().into();
+        assert!(write_all(&read_only, b"x").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_all_reports_full_device() {
+        let full: OwnedFd = OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap()
+            .into();
+        assert_eq!(write_all(&full, b"x"), Err(Errno::NOSPC));
+    }
+
+    #[test]
+    fn commit_succeeds_on_regular_file() {
+        let tmp = Tmp::new("commit");
+        let dst = tmp.open();
+        write_all(&dst, b"data").unwrap();
+
+        commit(&dst).unwrap();
+
+        assert_eq!(fs::read(&tmp.0).unwrap(), b"data");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commit_propagates_error() {
+        let null: OwnedFd = OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap()
+            .into();
+        assert_eq!(commit(&null), Err(Errno::INVAL));
+    }
+}

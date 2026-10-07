@@ -132,5 +132,102 @@ pub fn prompt_replace(name: &OsStr) -> bool {
     if std::io::stdin().lock().read_line(&mut answer).is_err() {
         return false;
     }
+    is_yes(&answer)
+}
+
+fn is_yes(answer: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("cb-mover-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn sync_path_regular_file() {
+        let tmp = Tmp::new("sync-file");
+        let file = tmp.0.join("f");
+        fs::write(&file, b"data").unwrap();
+
+        sync_path(&file).unwrap();
+
+        assert_eq!(fs::read(&file).unwrap(), b"data");
+    }
+
+    #[test]
+    fn sync_path_directory() {
+        let tmp = Tmp::new("sync-dir");
+        let dir = tmp.0.join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("f"), b"x").unwrap();
+
+        sync_path(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_path_missing_reports_noent() {
+        let tmp = Tmp::new("sync-missing");
+        assert_eq!(sync_path(&tmp.0.join("nope")), Err(Errno::NOENT));
+    }
+
+    #[test]
+    fn sync_path_unreadable_file_propagates_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = Tmp::new("sync-eacces");
+        let file = tmp.0.join("f");
+        fs::write(&file, b"x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&file).is_ok() {
+            return;
+        }
+
+        assert_eq!(sync_path(&file), Err(Errno::ACCESS));
+    }
+
+    #[test]
+    fn prompt_replace_declines_without_terminal() {
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+        assert!(!prompt_replace(OsStr::new("name")));
+    }
+
+    #[test]
+    fn is_yes_accepts_y_and_yes() {
+        for a in ["y", "Y", "yes", "Yes"] {
+            assert!(is_yes(a), "{a:?} should count as yes");
+            assert!(is_yes(&format!("{a}\n")), "{a:?} with newline should count");
+            assert!(is_yes(&format!("  {a}  ")), "{a:?} padded should count");
+        }
+    }
+
+    #[test]
+    fn is_yes_rejects_everything_else() {
+        for a in [
+            "", "n", "N", "no", "no!", "yep", "ye", "YES", "yEs", "1", "true",
+        ] {
+            assert!(!is_yes(a), "{a:?} should not count as yes");
+        }
+    }
 }

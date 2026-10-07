@@ -373,3 +373,138 @@ pub fn remove_any(path: &Path) -> IoResult<()> {
     }
     unlinkat(CWD, path, AtFlags::REMOVEDIR)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(not(target_vendor = "apple"))]
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("cb-walk-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        fn subdir(&self, name: &str) -> OwnedFd {
+            let dir = self.path(name);
+            fs::create_dir(&dir).unwrap();
+            File::open(dir).unwrap().into()
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn copy_symlink_recreates_link_without_following() {
+        let tmp = Tmp::new("sym");
+        let (src_dir, dst_dir) = (tmp.subdir("src"), tmp.subdir("dst"));
+        symlink("../target-not-there", tmp.path("src/l")).unwrap();
+
+        copy_symlink(&src_dir, c"l", &dst_dir, c"l").unwrap();
+
+        let copied = tmp.path("dst/l");
+        assert!(fs::symlink_metadata(&copied).unwrap().is_symlink());
+        assert_eq!(
+            fs::read_link(&copied).unwrap().as_os_str().as_bytes(),
+            b"../target-not-there"
+        );
+    }
+
+    #[test]
+    fn copy_symlink_replaces_existing_destination() {
+        let tmp = Tmp::new("sym-replace");
+        let (src_dir, dst_dir) = (tmp.subdir("src"), tmp.subdir("dst"));
+        symlink("new", tmp.path("src/l")).unwrap();
+        fs::write(tmp.path("dst/l"), b"old").unwrap();
+
+        copy_symlink(&src_dir, c"l", &dst_dir, c"l").unwrap();
+
+        assert_eq!(fs::read_link(tmp.path("dst/l")).unwrap(), Path::new("new"));
+    }
+
+    #[test]
+    fn copy_symlink_missing_source_reports_noent() {
+        let tmp = Tmp::new("sym-missing");
+        let (src_dir, dst_dir) = (tmp.subdir("src"), tmp.subdir("dst"));
+
+        assert_eq!(
+            copy_symlink(&src_dir, c"l", &dst_dir, c"l"),
+            Err(Errno::NOENT)
+        );
+    }
+
+    #[test]
+    fn copy_symlink_non_symlink_source_reports_inval() {
+        let tmp = Tmp::new("sym-regular");
+        let (src_dir, dst_dir) = (tmp.subdir("src"), tmp.subdir("dst"));
+        fs::write(tmp.path("src/f"), b"x").unwrap();
+
+        assert_eq!(
+            copy_symlink(&src_dir, c"f", &dst_dir, c"f"),
+            Err(Errno::INVAL)
+        );
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn copy_other_path_recreates_fifo() {
+        let tmp = Tmp::new("fifo");
+        let (src, dst) = (tmp.path("src"), tmp.path("dst"));
+        mknodat(CWD, &src, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+
+        copy_other_path(&src, &dst, FileType::Fifo).unwrap();
+
+        assert!(fs::symlink_metadata(&dst).unwrap().file_type().is_fifo());
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn copy_other_path_replaces_existing_destination() {
+        let tmp = Tmp::new("fifo-replace");
+        let (src, dst) = (tmp.path("src"), tmp.path("dst"));
+        mknodat(CWD, &src, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        copy_other_path(&src, &dst, FileType::Fifo).unwrap();
+
+        assert!(fs::symlink_metadata(&dst).unwrap().file_type().is_fifo());
+    }
+
+    #[test]
+    fn copy_other_path_missing_source_reports_noent() {
+        let tmp = Tmp::new("other-missing");
+        assert_eq!(
+            copy_other_path(&tmp.path("nope"), &tmp.path("dst"), FileType::Fifo),
+            Err(Errno::NOENT)
+        );
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn copy_other_path_missing_source_keeps_destination() {
+        let tmp = Tmp::new("other-keep");
+        let dst = tmp.path("dst");
+        fs::write(&dst, b"keep").unwrap();
+
+        assert!(copy_other_path(&tmp.path("nope"), &dst, FileType::Fifo).is_err());
+
+        assert_eq!(fs::read(&dst).unwrap(), b"keep");
+    }
+}
