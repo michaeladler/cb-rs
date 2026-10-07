@@ -80,7 +80,7 @@ Or from a clone: `cargo build --release`.
 Read these before pointing `cb-rs` at anything you care about.
 
 - A new `copy` or `cut` wipes the clipboard unless you pass `--amend`. Both lists are removed first. There is no history.
-- `paste` needs an existing destination; `-d` is never created for you. `--on-conflict skip|replace|ask` (default `skip`) decides what happens when a top-level entry already exists, and paste never merges: the whole entry is skipped, replaced, or, under `replace`, **emptied and renamed over** — replacing a directory deletes everything in it.
+- `paste` creates `-d` if it is missing, `mkdir -p` style, whole missing parents included, and fails if the path exists as something other than a directory. `--on-conflict skip|replace|ask` (default `skip`) decides what happens when a top-level entry already exists, and paste never merges: the whole entry is skipped, replaced, or, under `replace`, **emptied and renamed over** — replacing a directory deletes everything in it.
 - `copy` and `cut` record paths, not bytes, and nothing is read at record time. Editing, moving, or deleting a source before you paste means paste acts on whatever is at that path now, or fails. It is not a snapshot, so `cb copy f && rm f` followed by a paste will not produce `f`. Use `cp` if you want the bytes now.
 - Paste of copied paths does not empty the clipboard. The sources stay recorded, so a second paste copies them again. Only `cut` consumes.
 - `ask` needs a terminal. With stdin not a tty it answers no, so it behaves like `skip`.

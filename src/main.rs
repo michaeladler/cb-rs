@@ -289,14 +289,12 @@ fn record(
 }
 
 fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(), String> {
-    // Checked once here: a missing destination otherwise surfaces as one
-    // "No such file or directory" per source, naming the source, which is where
-    // the user is not looking.
-    if !dst_dir.is_dir() {
-        return Err(format!(
-            "{}: destination is not an existing directory",
-            dst_dir.display()
-        ));
+    // Created once here, mkdir -p style: per-entry creation would surface as
+    // one "No such file or directory" per source, naming the source, which is
+    // where the user is not looking. Fails only when the path exists as a
+    // non-directory, which then gets reported once, naming the destination.
+    if let Err(e) = std::fs::create_dir_all(dst_dir) {
+        return Err(format!("{}: {e}", dst_dir.display()));
     }
     let moves = clipboard.read_list(&clipboard.originals());
     let copies = clipboard.read_list(&clipboard.copies());

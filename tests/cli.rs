@@ -359,23 +359,49 @@ fn default_state_lives_under_its_own_directory() {
     );
 }
 
-/// A missing destination is reported once, naming the destination. Left to the
-/// per-entry path it produced one "No such file or directory" per source, which
-/// blames the source and sends the user looking in the wrong place.
+/// `-d` is created like `mkdir -p`, whole missing parents included. A failure
+/// is still reported once, naming the destination: left to the per-entry path
+/// it produced one "No such file or directory" per source, which blames the
+/// source and sends the user looking in the wrong place.
 #[test]
-fn paste_names_a_missing_destination_once() {
+fn paste_creates_the_destination_and_names_a_blocked_one_once() {
     let sandbox = Sandbox::new("nodest");
     sandbox.ok(&["copy", "kept", "moved.txt"]);
 
-    let out = sandbox.run(&["paste", "-d", "../nowhere"]);
+    let deep = sandbox.root.join("deep/nested/dest");
+    let out = Command::new(env!("CARGO_BIN_EXE_cb"))
+        .args(["paste", "-d"])
+        .arg(&deep)
+        .env("CLIPBOARD_PERSISTDIR", sandbox.root.join("state"))
+        .current_dir(sandbox.root.join("out"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(deep.join("kept/k.txt").exists());
+    assert!(deep.join("moved.txt").exists());
+
+    // A file in the way is not a directory and cannot become one.
+    let blocked = sandbox.root.join("blocked");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_cb"))
+        .args(["paste", "-d"])
+        .arg(&blocked)
+        .env("CLIPBOARD_PERSISTDIR", sandbox.root.join("state"))
+        .current_dir(sandbox.root.join("out"))
+        .output()
+        .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert_eq!(
-        err.matches("No such file or directory").count(),
-        0,
-        "the error must not be reported per source: {err}"
+        err.matches("File exists").count(),
+        1,
+        "the error must be reported once: {err}"
     );
-    assert!(err.contains("nowhere"), "{err}");
+    assert!(err.contains("blocked"), "{err}");
 }
 
 /// Paths are stored absolute, because paste runs in a directory the user never
