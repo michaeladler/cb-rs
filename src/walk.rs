@@ -8,12 +8,13 @@ use std::sync::atomic::{
 use std::sync::{Arc, Mutex};
 
 use crossbeam_deque::{Injector, Steal, Worker};
-use rustix::fd::OwnedFd;
+use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, fchmod, mkdirat, openat, readlinkat, renameat,
     statat, symlinkat, unlinkat,
 };
 use rustix::io::{Errno, Result as IoResult};
+use rustix::path::Arg;
 
 #[cfg(not(target_vendor = "apple"))]
 use rustix::fs::mknodat;
@@ -542,37 +543,77 @@ fn copy_other_path(src: &Path, dst: &Path, file_type: FileType) -> IoResult<()> 
 /// Remove a tree bottom-up. Only used to finish a move that `renameat2` could
 /// not perform because the two paths are on different filesystems.
 pub fn remove_any(path: &Path) -> IoResult<()> {
-    let st = match statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
+    let name = path.file_name().ok_or(Errno::INVAL)?;
+    let parent = path.parent().ok_or(Errno::INVAL)?;
+    if parent.as_os_str().is_empty() {
+        return remove_entry(CWD, name);
+    }
+    // The parent is held open for the whole delete: every operation below is
+    // relative to this fd, so a directory higher up that is swapped for a
+    // symlink after the open cannot redirect the delete. The parent itself
+    // still resolves with ordinary path semantics, so a symlink in the way
+    // is followed, as the user's path means it.
+    let dir_fd = match openat(
+        CWD,
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    remove_entry(&dir_fd, name)
+}
+
+fn remove_entry<Fd: AsFd + Copy, P: Arg + Copy>(dir_fd: Fd, name: P) -> IoResult<()> {
+    let st = match statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => st,
-        Err(e) if e == Errno::NOENT => return Ok(()),
+        Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(e),
     };
     if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
-        return unlinkat(CWD, path, AtFlags::empty());
+        return unlinkat(dir_fd, name, AtFlags::empty());
     }
-    // `NOFOLLOW`: the `statat` above named a directory, and a symlink swapped in
-    // between must fail the open rather than send the recursive delete into
-    // whatever it points at.
-    let dir_fd = openat(
-        CWD,
-        path,
+    // `NOFOLLOW`: a symlink swapped in at `name` must fail the open rather
+    // than send the recursive delete into whatever it points at.
+    let child_fd = openat(
+        dir_fd,
+        name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
         Mode::empty(),
     )?;
-    let mut dir = Dir::read_from(&dir_fd)?;
-    let mut children = Vec::new();
+    let _ = remove_children(&child_fd);
+    unlinkat(dir_fd, name, AtFlags::REMOVEDIR)
+}
+
+/// Remove every entry under an open directory fd, recursing into real
+/// directories. Names resolve against the fd rather than the filesystem, so a
+/// directory swapped for a symlink mid-walk cannot redirect the delete into
+/// its target.
+pub fn remove_children<Fd: AsFd + Copy>(dir_fd: Fd) -> IoResult<()> {
+    let mut dir = Dir::read_from(dir_fd)?;
+    let mut names = Vec::new();
     for entry in dir.by_ref() {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         if name == c"." || name == c".." {
             continue;
         }
-        children.push(path.join(OsStr::from_bytes(name.to_bytes())));
+        names.push(name.to_owned());
     }
-    for child in children {
-        let _ = remove_any(&child);
+    let mut first_err = None;
+    for name in &names {
+        if let Err(e) = remove_entry(dir_fd, name.as_c_str())
+            && first_err.is_none()
+        {
+            first_err = Some(e);
+        }
     }
-    unlinkat(CWD, path, AtFlags::REMOVEDIR)
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +727,81 @@ mod tests {
         assert!(
             tmp.path("real/keep.txt").exists(),
             "the link target must survive"
+        );
+    }
+
+    #[test]
+    fn remove_any_unlinks_a_symlinked_child_rather_than_its_target() {
+        let tmp = Tmp::new("rm-child-link");
+        let outside = tmp.path("outside");
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        fs::write(outside.join("sub/keep.txt"), b"keep").unwrap();
+        let root = tmp.path("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("f"), b"x").unwrap();
+        symlink(&outside, root.join("link")).unwrap();
+
+        remove_any(&root).unwrap();
+
+        assert!(!root.exists());
+        assert!(
+            outside.join("sub/keep.txt").exists(),
+            "the child link's target must survive"
+        );
+    }
+
+    #[test]
+    fn remove_any_stays_put_when_a_parent_is_swapped_for_a_symlink() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let tmp = Tmp::new("rm-swap");
+        let root = tmp.path("outer/mid/leaf");
+        fs::create_dir_all(&root).unwrap();
+        // A mirror of the tree under a second name: if the delete is ever
+        // resolved through the swapped symlink, this is what gets destroyed.
+        let victim = tmp.path("victim");
+        fs::create_dir_all(victim.join("leaf")).unwrap();
+        const FILES: usize = 10_000;
+        for i in 0..FILES {
+            fs::write(root.join(format!("f{i}")), b"x").unwrap();
+            fs::write(victim.join(format!("leaf/f{i}")), b"keep").unwrap();
+        }
+
+        let mid = tmp.path("outer/mid");
+        let mid_parked = tmp.path("outer/mid.bak");
+        let (mid_c, parked_c, victim_c) = (mid.clone(), mid_parked.clone(), victim.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+        let swapper = std::thread::spawn(move || {
+            // Wait past `remove_any`'s entry open (microseconds), then hold the
+            // swap for the rest of the delete: a path-based recursion
+            // re-resolves the parent on every child and on the final rmdir, so
+            // any timing of the delete lands on the symlink. The fd-based
+            // delete holds its own handles and is blind to it.
+            std::thread::sleep(Duration::from_millis(5));
+            let _ = fs::rename(&mid_c, &parked_c);
+            let _ = symlink(&victim_c, &mid_c);
+            // Hard ceiling: a panicked test never sets `stop`, and a live
+            // thread would hold the test binary open forever.
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !stop_c.load(Relaxed) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        remove_any(&root).unwrap();
+        stop.store(true, Relaxed);
+        swapper.join().unwrap();
+        // The swap is still in place; restore before asserting on the path.
+        let _ = fs::remove_file(&mid);
+        let _ = fs::rename(&mid_parked, &mid);
+
+        assert!(!root.exists());
+        let remaining = fs::read_dir(victim.join("leaf")).unwrap().count();
+        assert_eq!(
+            remaining, FILES,
+            "the symlink target must survive a redirected delete: {remaining}/{FILES} files left"
         );
     }
 

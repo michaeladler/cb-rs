@@ -1,6 +1,5 @@
 use std::ffi::OsStr;
 use std::io::{BufRead, IsTerminal, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use rustix::fs::{AtFlags, CWD, RenameFlags, linkat, renameat, renameat_with, statat, unlinkat};
@@ -124,27 +123,15 @@ fn clear_destination(dst: &Path) -> IoResult<()> {
         return Ok(());
     }
     // `NOFOLLOW`: the `statat` above named a directory, and a symlink swapped in
-    // between must fail the open rather than empty whatever it points at.
+    // between must fail the open rather than empty whatever it points at. The
+    // emptying then runs entirely on that fd.
     let dir_fd = rustix::fs::openat(
         CWD,
         dst,
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
         rustix::fs::Mode::empty(),
     )?;
-    let mut dir = rustix::fs::Dir::read_from(&dir_fd)?;
-    let mut children = Vec::new();
-    for entry in dir.by_ref() {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
-        if name == c"." || name == c".." {
-            continue;
-        }
-        children.push(dst.join(OsStr::from_bytes(name.to_bytes())));
-    }
-    for child in children {
-        walk::remove_any(&child)?;
-    }
-    Ok(())
+    walk::remove_children(&dir_fd)
 }
 
 /// Flush a freshly copied destination so a power loss cannot leave the source
