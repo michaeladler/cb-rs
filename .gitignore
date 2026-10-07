@@ -20,3 +20,6 @@ __pycache__
 # scripts/bench.py output; CI publishes it on the gh-pages branch
 bench.log
 *.cast
+
+# scratch playground scripts/record-demo.sh runs in, before the trap removes it
+.demo.*
