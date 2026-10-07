@@ -3,7 +3,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use rustix::fs::{AtFlags, CWD, RenameFlags, renameat, renameat_with, statat};
+use rustix::fs::{AtFlags, CWD, RenameFlags, linkat, renameat, renameat_with, statat, unlinkat};
 use rustix::io::{Errno, Result as IoResult};
 
 use crate::copy;
@@ -55,13 +55,21 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
 
 fn rename_noreplace(src: &Path, dst: &Path) -> IoResult<()> {
     match renameat_with(CWD, src, CWD, dst, RenameFlags::NOREPLACE) {
-        // Pre-3.15 kernels and some filesystems reject the flags word.
-        Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {
-            if statat(CWD, dst, AtFlags::empty()).is_ok() {
-                Err(Errno::EXIST)
-            } else {
-                renameat(CWD, src, CWD, dst)
+        // Pre-3.15 kernels and filesystems that never grew the flag. A plain
+        // `renameat` here would clobber whatever landed since the last check, so
+        // fall back to `linkat` + `unlinkat`, which fails with `EXIST` instead of
+        // overwriting. Directories cannot be linked; the caller turns that back
+        // into copy-then-delete.
+        Err(e @ (Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP)) => {
+            let st = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW)?;
+            if rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory {
+                return Err(e);
             }
+            linkat(CWD, src, CWD, dst, AtFlags::empty())?;
+            // The source is now reachable under both names, so an unlink failure
+            // leaves a copy rather than data loss.
+            unlinkat(CWD, src, AtFlags::empty())?;
+            Ok(())
         }
         other => other,
     }
@@ -203,6 +211,46 @@ mod tests {
         }
 
         assert_eq!(sync_path(&file), Err(Errno::ACCESS));
+    }
+
+    #[test]
+    fn rename_noreplace_keeps_existing_destination() {
+        let tmp = Tmp::new("noreplace");
+        let src = tmp.0.join("src");
+        let dst = tmp.0.join("dst");
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+
+        let result = rename_noreplace(&src, &dst);
+
+        assert_eq!(result, Err(Errno::EXIST));
+        assert_eq!(fs::read(&dst).unwrap(), b"old");
+        assert_eq!(fs::read(&src).unwrap(), b"new");
+    }
+
+    #[test]
+    fn rename_noreplace_replaces_dangling_symlink() {
+        let tmp = Tmp::new("noreplace-symlink");
+        let src = tmp.0.join("src");
+        let dst = tmp.0.join("dst");
+        fs::write(&src, b"new").unwrap();
+        std::os::unix::fs::symlink("missing", &dst).unwrap();
+
+        assert_eq!(rename_noreplace(&src, &dst), Err(Errno::EXIST));
+        assert!(fs::symlink_metadata(&dst).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn rename_noreplace_moves_when_destination_free() {
+        let tmp = Tmp::new("noreplace-free");
+        let src = tmp.0.join("src");
+        let dst = tmp.0.join("dst");
+        fs::write(&src, b"new").unwrap();
+
+        rename_noreplace(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"new");
+        assert!(!src.exists());
     }
 
     #[test]
