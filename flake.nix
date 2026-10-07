@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     crane.url = "github:ipetkov/crane";
+    nur-packages = {
+      url = "github:michaeladler/nur-packages";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     advisory-db = {
       url = "github:rustsec/advisory-db";
@@ -17,6 +21,7 @@
       nixpkgs,
       crane,
       advisory-db,
+      nur-packages,
       ...
     }:
     let
@@ -32,7 +37,12 @@
           system:
           f (
             let
-              pkgs = nixpkgs.legacyPackages.${system};
+              pkgs = import nixpkgs {
+                inherit system;
+                overlays = [
+                  nur-packages.overlays.default
+                ];
+              };
 
               src = pkgs.lib.fileset.toSource {
                 root = ./.;
@@ -219,6 +229,11 @@
               pkgs.zstd
               cargoDebugArtifacts
               reseedTarget
+
+              pkgs.tmux
+              pkgs.asciinema
+              pkgs.agg
+              pkgs.demo-magic
             ]
             ++ commonArgs.buildInputs;
 

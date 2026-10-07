@@ -7,12 +7,16 @@
 # demo-magic.sh comes from the demo-magic package (see devenv.nix). Override
 # the location with DEMO_MAGIC if it is not on PATH or in the nix store.
 
-source "${DEMO_MAGIC:-$(command -v demo-magic.sh || echo /nix/store/*/share/demo-magic.sh)}"
+source "${DEMO_MAGIC:-$(command -v demo-magic.sh)}"
 
 TYPE_SPEED=15
 NO_WAIT=true
 SHOW_CMD_NUMS=true
-DEMO_PROMPT='\[\e[1;32m\]cb-demo\[\e[0m\]:\[\e[1;34m\]\W\[\e[0m\]\$ '
+
+# demo-magic renders this prompt by running bash without readline, and that
+# path expands \e but not \[ \] -- those only matter to readline's column
+# count, so use real escapes here or the brackets show up as literal text.
+DEMO_PROMPT=$'\e[1;32mcb-demo\e[0m:\e[1;34m\\W\e[0m$ '
 
 # pe = print, type, execute. The sleeps are the only pacing: they hold the
 # frame long enough to read, since no one presses ENTER during a recording.

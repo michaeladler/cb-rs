@@ -47,11 +47,32 @@
         "type": "github"
       }
     },
+    "nur-packages": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791345013,
+        "narHash": "sha256-bWtTncRRpB1tTVobgJGjNOiqcVTUiWTxr36urftf2/M=",
+        "owner": "michaeladler",
+        "repo": "nur-packages",
+        "rev": "6b6468dc076b1c5d00b37d1068c9983835aa0c7e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "michaeladler",
+        "repo": "nur-packages",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "advisory-db": "advisory-db",
         "crane": "crane",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "nur-packages": "nur-packages"
       }
     }
   },
