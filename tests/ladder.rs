@@ -195,6 +195,44 @@ fn a_file_moves_over_an_existing_non_empty_directory() {
     );
 }
 
+/// A read-only destination cannot be opened `O_WRONLY`, so copying over it used
+/// to fail with `EACCES` even under `--on-conflict replace`.
+#[test]
+fn a_read_only_destination_is_replaced() {
+    let sandbox = Sandbox::new("ro-dst");
+    let src = sandbox.write("src.txt", b"new");
+    let dst = sandbox.write("dst.txt", b"old");
+    fs::set_permissions(&dst, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let failures = copy_any(&src, &dst);
+
+    fs::set_permissions(&dst, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(fs::read(&dst).unwrap(), b"new");
+}
+
+/// Writing the destination in place changed every other name that inode answers
+/// to. The copy lands under a temporary name and is renamed in, so only the
+/// pasted name changes.
+#[test]
+fn replacing_a_hard_linked_destination_leaves_the_other_names_alone() {
+    let sandbox = Sandbox::new("hardlink-dst");
+    let src = sandbox.write("src.txt", b"new");
+    let dst = sandbox.write("dst.txt", b"old");
+    let other = sandbox.path("other-name.txt");
+    fs::hard_link(&dst, &other).unwrap();
+
+    let failures = copy_any(&src, &dst);
+
+    assert!(failures.is_empty(), "{failures:?}");
+    assert_eq!(fs::read(&dst).unwrap(), b"new");
+    assert_eq!(
+        fs::read(&other).unwrap(),
+        b"old",
+        "the sibling name of the old inode must not change"
+    );
+}
+
 /// `cut f` in the folder that holds `f`, then `paste` there: the destination is
 /// the source. The replace policy used to empty the source before a rename that
 /// does nothing.

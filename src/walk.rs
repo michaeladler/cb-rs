@@ -516,6 +516,11 @@ pub fn staged_path(path: &Path) -> IoResult<PathBuf> {
     Ok(path.with_file_name(OsStr::from_bytes(&temp_bytes(name.as_bytes()))))
 }
 
+/// Regular files go through a temporary name like symlinks and device files do,
+/// not into the destination itself. Writing in place truncates it up front, so a
+/// failure partway through leaves a half-written file where a working one was,
+/// every other name of a hard-linked destination changes with it, and a
+/// read-only destination cannot be opened at all.
 fn copy_regular(
     src_dir: &OwnedFd,
     src_name: &CStr,
@@ -529,14 +534,16 @@ fn copy_regular(
         Mode::empty(),
     )?;
     let st = rustix::fs::fstat(&src_fd)?;
-    let dst_fd = openat(
-        dst_dir,
-        dst_name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-    copy::clone_file(&src_fd, &dst_fd, &st)?;
-    copy::preserve_mode(&dst_fd, Mode::from_raw_mode(st.st_mode))
+    replace_entry(dst_dir, dst_name, |tmp| {
+        let dst_fd = openat(
+            dst_dir,
+            tmp,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        copy::clone_file(&src_fd, &dst_fd, &st)?;
+        copy::preserve_mode(&dst_fd, Mode::from_raw_mode(st.st_mode))
+    })
 }
 
 /// Symlinks are recreated, never followed: following one would copy data the
@@ -563,13 +570,15 @@ fn copy_symlink_path(src: &Path, dst: &Path) -> IoResult<()> {
 fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
     let src_fd = rustix::fs::open(src, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())?;
     let st = rustix::fs::fstat(&src_fd)?;
-    let dst_fd = rustix::fs::open(
-        dst,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-    copy::clone_file(&src_fd, &dst_fd, &st)?;
-    copy::preserve_mode(&dst_fd, Mode::from_raw_mode(st.st_mode))
+    replace_entry_path(dst, |tmp| {
+        let dst_fd = rustix::fs::open(
+            tmp,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        copy::clone_file(&src_fd, &dst_fd, &st)?;
+        copy::preserve_mode(&dst_fd, Mode::from_raw_mode(st.st_mode))
+    })
 }
 
 fn copy_other_path(src: &Path, dst: &Path, file_type: FileType) -> IoResult<()> {
