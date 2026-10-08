@@ -8,7 +8,7 @@ use rustix::io::{Errno, Result as IoResult};
 use crate::copy;
 use crate::policy::Policy;
 use crate::walk;
-use crate::walk::Failure;
+use crate::walk::{Failure, Walked};
 
 /// What became of one move attempt.
 #[derive(Debug, PartialEq, Eq)]
@@ -70,13 +70,35 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
     // renames that onto place, so a destination that appears while the copy
     // runs is only ever replaced by a finished tree.
     let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
-    let outcome = stage_and_commit(src, &dst, &staged, policy);
+    let walked = Walked::default();
+    let outcome = stage_and_commit(src, &dst, &staged, policy, Some(&walked));
     if matches!(outcome, Ok(Outcome::Moved)) {
-        // The source goes only after the destination is on disk. A copy that came
-        // up short leaves the source in place, which is the whole point.
-        walk::remove_any(src).map_err(|e| one(src, e))?;
+        remove_moved_source(src, &walked)?;
     }
     outcome
+}
+
+/// Unlink the source of a committed cross-device move, but only while it still
+/// holds what the copy took.
+///
+/// The copy is a walk, and a walk is not atomic: a file written into the source
+/// after the walk read that directory was never copied, and deleting the source
+/// whole would lose it. The destination is already on disk at this point, so a
+/// source that changed is reported as a failure and left for the user: the
+/// entry stays in `originals`, and the next paste copies the whole thing again.
+fn remove_moved_source(src: &Path, walked: &Walked) -> Result<(), Vec<Failure>> {
+    let changed = walked.changed();
+    if !changed.is_empty() {
+        return Err(changed
+            .into_iter()
+            .map(|path| Failure {
+                path,
+                reason: "source changed while it was being copied, so it was not removed"
+                    .to_owned(),
+            })
+            .collect());
+    }
+    walk::remove_any(src).map_err(|e| one(src, e))
 }
 
 /// Copy `src` into `dst_dir`, like [`move_into`] but leaving the source alone.
@@ -106,7 +128,8 @@ pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
         return Ok(Outcome::Skipped);
     }
     let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
-    stage_and_commit(src, &dst, &staged, policy)
+    // A copy consumes nothing, so there is no source to check and nothing to record.
+    stage_and_commit(src, &dst, &staged, policy, None)
 }
 
 /// Copy `src` to `staged`, then rename it onto `dst`. A staged tree that did not
@@ -117,8 +140,9 @@ fn stage_and_commit(
     dst: &Path,
     staged: &Path,
     policy: Policy,
+    walked: Option<&Walked>,
 ) -> Result<Outcome, Vec<Failure>> {
-    let result = copy_then_commit(src, dst, staged, policy);
+    let result = copy_then_commit(src, dst, staged, policy, walked);
     if !matches!(result, Ok(Outcome::Moved)) {
         let _ = walk::remove_any(staged);
     }
@@ -130,8 +154,9 @@ fn copy_then_commit(
     dst: &Path,
     staged: &Path,
     policy: Policy,
+    walked: Option<&Walked>,
 ) -> Result<Outcome, Vec<Failure>> {
-    let failures = walk::copy_any(src, staged);
+    let failures = walk::copy_walking(src, staged, walked);
     if !failures.is_empty() {
         return Err(failures);
     }
@@ -411,7 +436,7 @@ mod tests {
         fs::write(&dst, b"old").unwrap();
 
         assert_eq!(
-            stage_and_commit(&src, &dst, &staged, Policy::Skip).map_err(|f| f.len()),
+            stage_and_commit(&src, &dst, &staged, Policy::Skip, None).map_err(|f| f.len()),
             Ok(Outcome::Skipped)
         );
 
@@ -440,7 +465,7 @@ mod tests {
         fs::write(dst.join("stale"), b"old").unwrap();
 
         assert_eq!(
-            stage_and_commit(&src, &dst, &staged, Policy::Replace).map_err(|f| f.len()),
+            stage_and_commit(&src, &dst, &staged, Policy::Replace, None).map_err(|f| f.len()),
             Ok(Outcome::Moved)
         );
 
@@ -455,6 +480,66 @@ mod tests {
             fs::read_dir(&tmp.0).unwrap().count(),
             2,
             "no staging leftovers in the destination directory"
+        );
+    }
+
+    /// The cross-device half of `move_into`, which a same-filesystem test never
+    /// reaches: commit a tree into `out/src` and hand back what the walk saw.
+    fn committed(src: &Path, out: &Path) -> Walked {
+        let dst = out.join(src.file_name().unwrap());
+        let staged = walk::staged_path(&dst).unwrap();
+        let walked = Walked::default();
+        assert_eq!(
+            stage_and_commit(src, &dst, &staged, Policy::Replace, Some(&walked))
+                .map_err(|f| f.len()),
+            Ok(Outcome::Moved)
+        );
+        walked
+    }
+
+    /// The move deleted the whole source tree after the copy, so a file written
+    /// into the source while the walk was elsewhere in it was destroyed without
+    /// ever having been copied.
+    #[test]
+    fn a_write_into_the_source_during_the_copy_keeps_the_source() {
+        let tmp = Tmp::new("changed-source");
+        let src = tmp.0.join("src");
+        let out = tmp.0.join("out");
+        fs::create_dir_all(src.join("inner")).unwrap();
+        fs::write(src.join("inner/f"), b"new").unwrap();
+        fs::create_dir(&out).unwrap();
+
+        let walked = committed(&src, &out);
+        fs::write(src.join("inner/late"), b"late").unwrap();
+
+        let failures = remove_moved_source(&src, &walked).unwrap_err();
+        assert_eq!(fs::read(src.join("inner/late")).unwrap(), b"late");
+        assert!(
+            !out.join("src/inner/late").exists(),
+            "the premise: the late file was never copied"
+        );
+        assert!(
+            failures.iter().any(|f| f.path == src.join("inner")),
+            "the directory that changed must be named: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_source_is_removed_after_a_cross_device_copy() {
+        let tmp = Tmp::new("unchanged-source");
+        let src = tmp.0.join("src");
+        let out = tmp.0.join("out");
+        fs::create_dir_all(src.join("inner")).unwrap();
+        fs::write(src.join("inner/f"), b"new").unwrap();
+        fs::create_dir(&out).unwrap();
+
+        let walked = committed(&src, &out);
+
+        assert!(walked.changed().is_empty());
+        assert!(remove_moved_source(&src, &walked).is_ok());
+        assert!(
+            !src.exists(),
+            "a completed cross-device move consumes its source"
         );
     }
 
@@ -473,7 +558,8 @@ mod tests {
         let staged = walk::staged_path(&dst).unwrap();
         std::os::unix::fs::symlink("nowhere", &src).unwrap();
 
-        let outcome = copy_then_commit(&src, &dst, &staged, Policy::Skip).map_err(|f| f.len());
+        let outcome =
+            copy_then_commit(&src, &dst, &staged, Policy::Skip, None).map_err(|f| f.len());
 
         assert_eq!(outcome, Ok(Outcome::Moved));
         assert_eq!(fs::read_link(&dst).unwrap(), Path::new("nowhere"));

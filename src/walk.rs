@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam_deque::{Injector, Steal, Worker};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
-    AtFlags, CWD, Dir, FileType, Mode, OFlags, fchmod, mkdirat, openat, readlinkat, renameat,
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat, fchmod, mkdirat, openat, readlinkat, renameat,
     statat, symlinkat, unlinkat,
 };
 use rustix::io::{Errno, Result as IoResult};
@@ -83,6 +83,10 @@ pub struct Failure {
 #[derive(Default)]
 struct Report {
     failures: Mutex<Vec<Failure>>,
+    /// `None` unless the caller can use it. A copy has no use for it, so
+    /// recording is not free by default: one `Stat` and a `PathBuf` per
+    /// directory would be spent on nothing.
+    walked: Option<Walked>,
 }
 
 impl Report {
@@ -100,11 +104,105 @@ impl Report {
     fn take(&self) -> Vec<Failure> {
         std::mem::take(&mut *self.failures.lock().unwrap())
     }
+
+    fn note(&self, path: &Path, st: &Stat, entries: usize) {
+        if let Some(walked) = &self.walked {
+            walked.note(path, st, entries);
+        }
+    }
+}
+
+/// One source directory, as the walk saw it.
+struct Seen {
+    path: PathBuf,
+    st: Stat,
+    entries: usize,
+}
+
+/// What the copy saw of the source tree, so the caller can tell whether the
+/// source still holds what was copied.
+#[derive(Clone, Default)]
+pub struct Walked(Arc<Mutex<Vec<Seen>>>);
+
+impl Walked {
+    fn note(&self, path: &Path, st: &Stat, entries: usize) {
+        self.0.lock().unwrap().push(Seen {
+            path: path.to_path_buf(),
+            st: *st,
+            entries,
+        });
+    }
+
+    /// The source directories that no longer hold what the copy took: gone,
+    /// swapped for another inode, or changed inside.
+    ///
+    /// A cross-device move deletes the source only when this is empty. Anything
+    /// written into the source after the walk read a directory was never
+    /// copied, and deleting the source would lose it.
+    pub fn changed(&self) -> Vec<PathBuf> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| !unchanged(seen))
+            .map(|seen| seen.path.clone())
+            .collect()
+    }
+}
+
+/// Whether the directory still holds the inode, the timestamps and the entry
+/// count the walk saw. Opened by name: anything a swap does in between turns
+/// into a refusal to delete, never into a deletion of something else.
+fn unchanged(seen: &Seen) -> bool {
+    let Ok(fd) = openat(
+        CWD,
+        &seen.path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let Ok(st) = rustix::fs::fstat(&fd) else {
+        return false;
+    };
+    if st.st_dev != seen.st.st_dev
+        || st.st_ino != seen.st.st_ino
+        || st.st_mtime != seen.st.st_mtime
+        || st.st_size != seen.st.st_size
+    {
+        return false;
+    }
+    // The timestamps alone would do for almost everything, but a directory's
+    // mtime comes from the kernel's coarse clock, so a write landing in the
+    // same tick as the `readdir` leaves it untouched. The entry count is what
+    // catches that one.
+    count_entries(&fd) == Some(seen.entries)
+}
+
+fn count_entries(dir_fd: &OwnedFd) -> Option<usize> {
+    let dir = Dir::read_from(dir_fd).ok()?;
+    let mut count = 0;
+    for entry in dir {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if name != c"." && name != c".." {
+            count += 1;
+        }
+    }
+    Some(count)
 }
 
 /// Copy `src` to `dst` (creating it), recursing into directories in parallel.
 /// Returns every entry that could not be copied.
 pub fn copy_any(src: &Path, dst: &Path) -> Vec<Failure> {
+    copy_walking(src, dst, None)
+}
+
+/// `copy_any`, recording what the walk saw of the source tree for a caller that
+/// has to know whether the source still holds what was copied.
+///
+/// A copy deletes nothing, so `walked` is `None` there and nothing is recorded.
+pub fn copy_walking(src: &Path, dst: &Path, walked: Option<&Walked>) -> Vec<Failure> {
     let report = Arc::new(Report::default());
     if same_file(src, dst).unwrap_or(false) {
         report.reject(src, "source and destination are the same file");
@@ -114,7 +212,7 @@ pub fn copy_any(src: &Path, dst: &Path) -> Vec<Failure> {
         report.reject(src, "destination is inside the source");
         return report.take();
     }
-    crate::progress::track(src, || copy_tree(src, dst))
+    crate::progress::track(src, || copy_tree(src, dst, walked))
 }
 
 /// Whether `dst` would land inside the `src` tree, so the copy recurses into its
@@ -146,8 +244,11 @@ pub fn same_file(a: &Path, b: &Path) -> IoResult<bool> {
     Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> Vec<Failure> {
-    let report = Arc::new(Report::default());
+fn copy_tree(src: &Path, dst: &Path, walked: Option<&Walked>) -> Vec<Failure> {
+    let report = Arc::new(Report {
+        walked: walked.cloned(),
+        ..Report::default()
+    });
     let st = match statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => st,
         Err(e) => {
@@ -402,6 +503,7 @@ fn process(task: &DirTask, queue: &Queue, report: &Arc<Report>) {
             return;
         }
     };
+    let mut count = 0;
     for entry in dir.by_ref() {
         // An entry the walk never read is never copied, yet the copy still
         // reports success, and a cross-device move then deletes the source.
@@ -416,6 +518,7 @@ fn process(task: &DirTask, queue: &Queue, report: &Arc<Report>) {
         if name == c"." || name == c".." {
             continue;
         }
+        count += 1;
         handle_entry(
             &src_fd,
             &dst_fd,
@@ -425,6 +528,14 @@ fn process(task: &DirTask, queue: &Queue, report: &Arc<Report>) {
             queue,
             report,
         );
+    }
+    // What the directory held once the walk was done with it, so a move can
+    // tell afterwards whether the source still holds what was copied.
+    match rustix::fs::fstat(&src_fd) {
+        Ok(st) => report.note(&task.src, &st, count),
+        // Without the stat the source cannot be checked at all, and an
+        // unverifiable source is one a move must not delete.
+        Err(e) => report.fail(&task.src, e),
     }
 }
 
@@ -1211,7 +1322,7 @@ mod tests {
         fs::write(tmp.path("src/ro/secret"), b"x").unwrap();
         fs::set_permissions(tmp.path("src/ro"), fs::Permissions::from_mode(0o000)).unwrap();
 
-        let failures = copy_tree(&tmp.path("src"), &tmp.path("dst"));
+        let failures = copy_tree(&tmp.path("src"), &tmp.path("dst"), None);
         fs::set_permissions(tmp.path("src/ro"), fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
@@ -1232,7 +1343,7 @@ mod tests {
         // EEXIST and the eventual `fchmod` must not follow it.
         symlink(&victim, tmp.path("dst")).unwrap();
 
-        let failures = copy_tree(&tmp.path("src"), &tmp.path("dst"));
+        let failures = copy_tree(&tmp.path("src"), &tmp.path("dst"), None);
         assert!(
             failures.iter().any(|f| f.path == tmp.path("dst")),
             "the symlinked destination must be reported: {failures:?}"
@@ -1286,7 +1397,7 @@ mod tests {
             }
         }
 
-        assert!(copy_tree(&src, &tmp.path("dst")).is_empty());
+        assert!(copy_tree(&src, &tmp.path("dst"), None).is_empty());
 
         let threads = walkers().lock().unwrap().len();
         assert!(
@@ -1342,7 +1453,7 @@ mod tests {
         )
         .unwrap();
 
-        let failures = copy_tree(&src, &dst);
+        let failures = copy_tree(&src, &dst, None);
         assert!(failures.is_empty(), "{failures:?}");
         let count = fs::read_dir(&dst).unwrap().count();
         assert_eq!(count, usize::try_from(dirs).unwrap());
@@ -1359,7 +1470,7 @@ mod tests {
         // copy must still be able to create `child.txt` inside `ro`.
         fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
 
-        let failures = copy_tree(&src, &dst);
+        let failures = copy_tree(&src, &dst, None);
         // Restore the source so the guard's cleanup can walk it.
         fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
 
