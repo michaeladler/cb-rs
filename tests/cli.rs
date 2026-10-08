@@ -432,6 +432,36 @@ fn a_path_containing_a_newline_round_trips_as_one_entry() {
     );
 }
 
+/// A cut records the link, not its target: canonicalizing the item itself
+/// followed the symlink, so pasting moved the target directory and landed it
+/// under the target's name.
+#[test]
+fn a_cut_symlink_moves_the_link_and_leaves_its_target_alone() {
+    let sandbox = Sandbox::new("symlink");
+    std::os::unix::fs::symlink("kept", sandbox.root.join("work/link")).unwrap();
+
+    sandbox.ok(&["cut", "link"]);
+    let listed = sandbox.ok(&["list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        format!("cut\t{}\n", sandbox.root.join("work/link").display()),
+        "the link's own path must be recorded"
+    );
+
+    sandbox.ok(&["paste", "-d", "../out"]);
+    assert!(
+        sandbox.work("kept/k.txt"),
+        "the target must stay where it was"
+    );
+    assert!(
+        std::fs::symlink_metadata(sandbox.root.join("out/link"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link must land under its own name"
+    );
+}
+
 /// Paths are stored absolute, because paste runs in a directory the user never
 /// named. A relative path recorded from `work` would not resolve from `out`.
 #[test]

@@ -233,6 +233,26 @@ fn main() -> ExitCode {
     }
 }
 
+/// The absolute path recorded for `item`: its parent made absolute and
+/// canonical, with the original file name joined back on unread.
+fn absolute_source(item: &Path) -> std::io::Result<PathBuf> {
+    // Existence check that does not resolve the final component, so the error
+    // for a missing source still names it.
+    item.symlink_metadata()?;
+    match (item.parent(), item.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            Ok(parent.canonicalize()?.join(name))
+        }
+        // A root path has no parent to canonicalize away; take it whole.
+        _ => item.canonicalize(),
+    }
+}
+
 /// `cut` and `copy` store the same thing: absolute source paths. They differ
 /// only in which list the paths land in, so `paste` knows to move or to copy
 /// them. Nothing is read here, so a recorded clipboard costs a few bytes per
@@ -249,8 +269,12 @@ fn record(
     let mut errors = Vec::new();
     for item in items {
         // Absolute, because paste runs somewhere else: the directory a path was
-        // given in is not the one it will be resolved from.
-        match std::fs::canonicalize(item) {
+        // given in is not the one it will be resolved from. Only the parent is
+        // canonicalized: canonicalizing the item would follow a symlink and
+        // record its target, so `cut mylink` would move the target under the
+        // target's name. Joining the name back on keeps the link itself, which
+        // is what the walker recreates.
+        match absolute_source(item) {
             Ok(path) => sources.push(path),
             Err(e) => errors.push(format!("{}: {e}", item.display())),
         }
