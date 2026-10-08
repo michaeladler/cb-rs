@@ -593,18 +593,35 @@ fn sync_dir<Fd: AsFd + Copy>(dir_fd: Fd) -> IoResult<()> {
     copy::commit(&dir_fd)
 }
 
+/// Open a source that was classified as a regular file, and check it still is.
+///
+/// `O_NONBLOCK`: the name is classified by `d_type` and opened some syscalls
+/// later, so a fifo swapped in between would otherwise block this process and
+/// every other copy behind it, waiting for a writer that may never come. On a
+/// regular file the flag changes nothing, so it stays.
+///
+/// `fstat` after the open, and only then: a device node opened `O_WRONLY` sends
+/// the bytes to the device, which the open itself already did.
+fn open_regular<P: rustix::path::Arg>(dir: impl AsFd, path: P) -> IoResult<OwnedFd> {
+    let fd = openat(
+        dir,
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(Errno::INVAL);
+    }
+    Ok(fd)
+}
+
 fn copy_regular(
     src_dir: &OwnedFd,
     src_name: &CStr,
     dst_dir: &OwnedFd,
     dst_name: &CStr,
 ) -> IoResult<()> {
-    let src_fd = openat(
-        src_dir,
-        src_name,
-        OFlags::RDONLY | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )?;
+    let src_fd = open_regular(src_dir, src_name)?;
     let st = rustix::fs::fstat(&src_fd)?;
     replace_entry(dst_dir, dst_name, |tmp| {
         let dst_fd = openat(
@@ -640,7 +657,7 @@ fn copy_symlink_path(src: &Path, dst: &Path) -> IoResult<()> {
 }
 
 fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
-    let src_fd = rustix::fs::open(src, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())?;
+    let src_fd = open_regular(CWD, src)?;
     let st = rustix::fs::fstat(&src_fd)?;
     replace_entry_path(dst, |tmp| {
         let dst_fd = rustix::fs::open(
@@ -792,6 +809,36 @@ mod tests {
             reset(&self.0);
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The source is classified by `d_type` and opened some syscalls later.
+    /// Swapped for a fifo in between, `O_RDONLY` blocks until a writer arrives.
+    #[test]
+    fn a_fifo_source_is_refused_rather_than_opened() {
+        let tmp = Tmp::new("fifo-src");
+        let (src_dir, dst_dir) = (tmp.subdir("src"), tmp.subdir("dst"));
+        mknodat(&src_dir, c"p", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+
+        assert_eq!(copy_regular(&src_dir, c"p", &dst_dir, c"p"), Err(Errno::INVAL));
+        assert_eq!(fs::read_dir(tmp.path("dst")).unwrap().count(), 0);
+    }
+
+    /// A device node opened `O_WRONLY` sends the bytes to the device, so the
+    /// destination must never be opened by name.
+    #[test]
+    fn a_fifo_destination_is_not_written_to() {
+        let tmp = Tmp::new("fifo-dst");
+        let (src_dir, dst_dir) = (tmp.subdir("src"), tmp.subdir("dst"));
+        fs::write(tmp.path("src/f"), b"payload").unwrap();
+        mknodat(&dst_dir, c"p", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+
+        copy_regular(&src_dir, c"f", &dst_dir, c"p").unwrap();
+
+        assert_eq!(
+            fs::read(tmp.path("dst/p")).unwrap(),
+            b"payload",
+            "the copy must replace the fifo, not block on or write to it"
+        );
     }
 
     #[test]
