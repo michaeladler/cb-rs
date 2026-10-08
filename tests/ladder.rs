@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
-use cb_rs::mover::{Outcome, copy_into, move_into};
+use cb_rs::mover::{CopyOutcome, Outcome, copy_into, move_into};
 use cb_rs::policy::Policy;
 use cb_rs::walk::{self, copy_any, remove_any};
 
@@ -307,7 +307,7 @@ fn a_replaced_directory_is_not_merged_into() {
 
     let outcome = copy_into(&src, &dst_dir, Policy::Replace).unwrap();
 
-    assert!(matches!(outcome, Outcome::Moved));
+    assert!(matches!(outcome, CopyOutcome::Copied));
     let dst = dst_dir.join("tree");
     assert_eq!(fs::read(dst.join("inner/new.txt")).unwrap(), b"new");
     assert!(
@@ -331,7 +331,7 @@ fn a_file_replaces_a_directory() {
 
     let outcome = copy_into(&src, &dst_dir, Policy::Replace).unwrap();
 
-    assert!(matches!(outcome, Outcome::Moved));
+    assert!(matches!(outcome, CopyOutcome::Copied));
     assert_eq!(fs::read(dst_dir.join("file.txt")).unwrap(), b"new");
 }
 

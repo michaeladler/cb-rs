@@ -25,10 +25,7 @@ use rustix::fs::mknodat;
 #[cfg(target_os = "linux")]
 use rustix::fs::{ResolveFlags, openat2};
 
-/// macOS has no `mknodat` — it was never taken up by the BSDs — and rustix
-/// ships no path-based `mknod` to fall back on, so go through libc's `mknod`
-/// on a path. `getpath` recovers the directory an fd names, which is what the
-/// path has to be relative to.
+/// rustix does not expose macOS `mknodat`, so use libc's fd-relative call.
 #[cfg(target_vendor = "apple")]
 fn mknodat<P: rustix::path::Arg, Fd: rustix::fd::AsFd>(
     dirfd: Fd,
@@ -39,33 +36,20 @@ fn mknodat<P: rustix::path::Arg, Fd: rustix::fd::AsFd>(
 ) -> IoResult<()> {
     use std::os::fd::{AsFd, AsRawFd};
 
-    // `CWD` is not a real fd, so `getpath` cannot name it; the process working
-    // directory is the directory it stands for.
-    let dir = if dirfd.as_fd().as_raw_fd() == CWD.as_fd().as_raw_fd() {
-        let cwd = std::env::current_dir().map_err(|_| Errno::IO)?;
-        cwd.into_os_string().into_encoded_bytes()
-    } else {
-        rustix::fs::getpath(dirfd)?.into_bytes()
-    };
-
     path.into_with_c_str(|path| {
-        let bytes = path.to_bytes();
-        let full = if bytes.starts_with(b"/") {
-            bytes.to_vec()
-        } else {
-            let mut full = dir.clone();
-            full.push(b'/');
-            full.extend_from_slice(bytes);
-            full
-        };
-        let Ok(full) = CString::new(full) else {
-            return Err(Errno::INVAL);
-        };
-        // SAFETY: `full` is NUL-terminated and outlives the call.
-        if unsafe { libc::mknod(full.as_ptr(), mode.bits() | file_type.as_raw_mode(), dev) } == 0 {
+        // SAFETY: `path` is NUL-terminated and `dirfd` stays borrowed through the call.
+        if unsafe {
+            libc::mknodat(
+                dirfd.as_fd().as_raw_fd(),
+                path.as_ptr(),
+                mode.bits() | file_type.as_raw_mode(),
+                dev,
+            )
+        } == 0
+        {
             Ok(())
         } else {
-            Err(Errno::from_raw_os_error(unsafe { *libc::__error() }))
+            Err(Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::IO))
         }
     })
 }

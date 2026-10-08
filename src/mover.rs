@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use rustix::fs::{AtFlags, CWD, RenameFlags, linkat, renameat, renameat_with, statat, unlinkat};
 use rustix::io::{Errno, Result as IoResult};
@@ -31,6 +32,18 @@ pub enum Outcome {
     /// consumed, not left to be pasted over the destination again.
     MovedWithLeftover(Failure),
     /// Destination exists and policy said leave it alone.
+    Skipped,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CopyOutcome {
+    Copied,
+    Skipped,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CommitOutcome {
+    Committed,
     Skipped,
 }
 
@@ -88,11 +101,11 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
     // runs is only ever replaced by a finished tree.
     let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
     let walked = Walked::default();
-    let outcome = stage_and_commit(src, &dst, &staged, policy, Some(&walked), None);
-    if matches!(outcome, Ok(Outcome::Moved)) {
-        return remove_moved_source(src, &walked);
+    match stage_and_commit(src, &dst, &staged, policy, Some(&walked), None) {
+        Ok(CommitOutcome::Committed) => remove_moved_source(src, &walked),
+        Ok(CommitOutcome::Skipped) => Ok(Outcome::Skipped),
+        Err(failures) => Err(failures),
     }
-    outcome
 }
 
 /// Finish a committed cross-device move: unlink the source, but only while it
@@ -134,7 +147,7 @@ fn remove_moved_source(src: &Path, walked: &Walked) -> Result<Outcome, Vec<Failu
 ///
 /// Staged and renamed in like a move. An existing destination is approved before
 /// the copy, then re-approved only if its inode changes before commit.
-pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, Vec<Failure>> {
+pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<CopyOutcome, Vec<Failure>> {
     let name = src.file_name().ok_or_else(|| {
         vec![Failure {
             path: src.to_path_buf(),
@@ -144,7 +157,7 @@ pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
     let dst = dst_dir.join(name);
     walk::clean_stale_temps_at_path(dst_dir);
     if walk::same_file(src, &dst).unwrap_or(false) {
-        return Ok(Outcome::Skipped);
+        return Ok(CopyOutcome::Skipped);
     }
     if walk::inside_source(src, &dst).unwrap_or(false) {
         return Err(vec![Failure {
@@ -154,11 +167,14 @@ pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
     }
     let approved_dst = destination_identity(&dst).map_err(|e| one(src, e))?;
     if approved_dst.is_some() && !policy.resolve(&dst).map_err(|e| one(src, e))? {
-        return Ok(Outcome::Skipped);
+        return Ok(CopyOutcome::Skipped);
     }
     let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
     // A copy consumes nothing, so there is no source to check and nothing to record.
-    stage_and_commit(src, &dst, &staged, policy, None, approved_dst)
+    stage_and_commit(src, &dst, &staged, policy, None, approved_dst).map(|outcome| match outcome {
+        CommitOutcome::Committed => CopyOutcome::Copied,
+        CommitOutcome::Skipped => CopyOutcome::Skipped,
+    })
 }
 
 /// Copy `src` to `staged`, then rename it onto `dst`. A staged tree that did not
@@ -171,9 +187,9 @@ fn stage_and_commit(
     policy: Policy,
     walked: Option<&Walked>,
     approved_dst: Option<DestinationIdentity>,
-) -> Result<Outcome, Vec<Failure>> {
+) -> Result<CommitOutcome, Vec<Failure>> {
     let result = copy_then_commit(src, dst, staged, policy, walked, approved_dst);
-    if !matches!(result, Ok(Outcome::Moved)) {
+    if !matches!(result, Ok(CommitOutcome::Committed)) {
         let _ = walk::remove_any(staged);
     }
     result
@@ -186,7 +202,7 @@ fn copy_then_commit(
     policy: Policy,
     walked: Option<&Walked>,
     approved_dst: Option<DestinationIdentity>,
-) -> Result<Outcome, Vec<Failure>> {
+) -> Result<CommitOutcome, Vec<Failure>> {
     let failures = walk::copy_walking(src, staged, walked);
     if !failures.is_empty() {
         return Err(failures);
@@ -197,14 +213,14 @@ fn copy_then_commit(
         && current_dst.is_some()
         && !policy.resolve(dst).map_err(|e| one(src, e))?
     {
-        return Ok(Outcome::Skipped);
+        return Ok(CommitOutcome::Skipped);
     }
     replace_by_rename(staged, dst).map_err(|e| replace_failure(src, e))?;
     // The whole tree, then the parent: a crash after the source is unlinked must
     // find the destination readable, contents included, and holding the name.
     walk::sync_tree(dst).map_err(|e| committed_failure(src, e))?;
     sync_parent(dst).map_err(|e| committed_failure(src, e))?;
-    Ok(Outcome::Moved)
+    Ok(CommitOutcome::Committed)
 }
 
 fn committed_failure(src: &Path, error: Errno) -> Vec<Failure> {
@@ -335,6 +351,8 @@ fn sync_parent(path: &Path) -> IoResult<()> {
 
 pub fn prompt_replace(name: &OsStr) -> bool {
     if !std::io::stdin().is_terminal() {
+        static NOTICE: OnceLock<()> = OnceLock::new();
+        NOTICE.get_or_init(|| eprintln!("cb: not a terminal, skipping"));
         return false;
     }
     let mut answer = String::new();
@@ -551,7 +569,7 @@ mod tests {
 
         assert_eq!(
             stage_and_commit(&src, &dst, &staged, Policy::Skip, None, None).map_err(|f| f.len()),
-            Ok(Outcome::Skipped)
+            Ok(CommitOutcome::Skipped)
         );
 
         assert_eq!(fs::read(&dst).unwrap(), b"old");
@@ -580,7 +598,7 @@ mod tests {
 
         assert_eq!(
             stage_and_commit(&src, &dst, &staged, Policy::Replace, None, None).map_err(|f| f.len()),
-            Ok(Outcome::Moved)
+            Ok(CommitOutcome::Committed)
         );
 
         assert_eq!(fs::read(dst.join("nested/f")).unwrap(), b"new");
@@ -606,7 +624,7 @@ mod tests {
         assert_eq!(
             stage_and_commit(src, &dst, &staged, Policy::Replace, Some(&walked), None)
                 .map_err(|f| f.len()),
-            Ok(Outcome::Moved)
+            Ok(CommitOutcome::Committed)
         );
         walked
     }
@@ -711,7 +729,7 @@ mod tests {
         let outcome =
             copy_then_commit(&src, &dst, &staged, Policy::Skip, None, None).map_err(|f| f.len());
 
-        assert_eq!(outcome, Ok(Outcome::Moved));
+        assert_eq!(outcome, Ok(CommitOutcome::Committed));
         assert_eq!(fs::read_link(&dst).unwrap(), Path::new("nowhere"));
     }
 
@@ -727,7 +745,7 @@ mod tests {
 
         let result = stage_and_commit(&src, &dst, &staged, Policy::Skip, None, approved_dst);
 
-        assert_eq!(result, Ok(Outcome::Moved));
+        assert_eq!(result, Ok(CommitOutcome::Committed));
         assert_eq!(fs::read(&dst).unwrap(), b"new");
     }
 
@@ -746,8 +764,25 @@ mod tests {
 
         let result = stage_and_commit(&src, &dst, &staged, Policy::Skip, None, approved_dst);
 
-        assert_eq!(result, Ok(Outcome::Skipped));
+        assert_eq!(result, Ok(CommitOutcome::Skipped));
         assert_eq!(fs::read(&dst).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn copy_into_reports_copy_and_keeps_the_source() {
+        let tmp = Tmp::new("copy-success");
+        let src = tmp.0.join("src");
+        let dst_dir = tmp.0.join("out");
+        fs::write(&src, b"payload").unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+
+        assert_eq!(
+            copy_into(&src, &dst_dir, Policy::Skip),
+            Ok(CopyOutcome::Copied)
+        );
+
+        assert_eq!(fs::read(dst_dir.join("src")).unwrap(), b"payload");
+        assert_eq!(fs::read(&src).unwrap(), b"payload");
     }
 
     #[test]
@@ -760,7 +795,7 @@ mod tests {
 
         let outcome = copy_into(&src, &tmp.0, Policy::Skip).map_err(|f| f.len());
 
-        assert_eq!(outcome, Ok(Outcome::Skipped));
+        assert_eq!(outcome, Ok(CopyOutcome::Skipped));
         assert_eq!(fs::read(tmp.0.join("dst")).unwrap(), b"old");
         assert!(src.join("f").exists(), "a copy never consumes its source");
         assert_eq!(

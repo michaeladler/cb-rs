@@ -338,13 +338,7 @@ fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(),
     // block every other `cb` command for the length of the copy; the rewrite
     // that consumes a move goes through `Clipboard::consume`, which takes the
     // lock again and merges consumed paths into any newer list.
-    let (moves, copies) = {
-        let _lock = clipboard.lock().map_err(|e| e.to_string())?;
-        (
-            clipboard.read_list(&clipboard.originals()),
-            clipboard.read_list(&clipboard.copies()),
-        )
-    };
+    let (moves, copies) = read_lists(clipboard)?;
     if moves.is_empty() && copies.is_empty() {
         println!("clipboard is empty");
         return Ok(());
@@ -448,8 +442,8 @@ fn paste_copies(dst_dir: &Path, policy: Policy, sources: &[PathBuf]) -> Result<(
         // rather than merged into.
         match mover::copy_into(source, dst_dir, policy) {
             // A copy consumes nothing, so there is no source left to remove.
-            Ok(mover::Outcome::Moved) | Ok(mover::Outcome::MovedWithLeftover(_)) => pasted += 1,
-            Ok(mover::Outcome::Skipped) => skipped += 1,
+            Ok(mover::CopyOutcome::Copied) => pasted += 1,
+            Ok(mover::CopyOutcome::Skipped) => skipped += 1,
             Err(mut copy_failures) => failures.append(&mut copy_failures),
         }
     }
@@ -459,11 +453,20 @@ fn paste_copies(dst_dir: &Path, policy: Policy, sources: &[PathBuf]) -> Result<(
     report(pasted, &failures, "pasted")
 }
 
+fn read_lists(clipboard: &Clipboard) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let _lock = clipboard.lock().map_err(|e| e.to_string())?;
+    Ok((
+        clipboard.read_list(&clipboard.originals()),
+        clipboard.read_list(&clipboard.copies()),
+    ))
+}
+
 fn do_list(clipboard: &Clipboard) -> Result<(), String> {
-    for source in clipboard.read_list(&clipboard.originals()) {
+    let (moves, copies) = read_lists(clipboard)?;
+    for source in moves {
         println!("cut\t{}", source.display());
     }
-    for source in clipboard.read_list(&clipboard.copies()) {
+    for source in copies {
         println!("copy\t{}", source.display());
     }
     Ok(())
