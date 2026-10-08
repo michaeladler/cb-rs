@@ -50,17 +50,17 @@ impl Clipboard {
     }
 
     pub fn ensure(&self) -> std::io::Result<()> {
-        let state = state_root();
-        let fallback = self.root.starts_with(&state) && state == fallback_root();
+        self.ensure_at(&state_root())
+    }
+
+    fn ensure_at(&self, state: &Path) -> std::io::Result<()> {
+        let fallback = self.root.starts_with(state) && state == fallback_root();
         if fallback {
-            ensure_fallback_root(&state)?;
+            ensure_fallback_root(state)?;
         }
         let metadata = self.root.join(METADATA);
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true).mode(0o700).create(&metadata)?;
-        if self.root.starts_with(&state) && !fallback {
-            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
-        }
         std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
         std::fs::set_permissions(metadata, std::fs::Permissions::from_mode(0o700))
     }
@@ -327,6 +327,37 @@ mod tests {
         drop(held);
         rx.recv_timeout(Duration::from_secs(10))
             .expect("the lock must be released when it is dropped");
+    }
+
+    #[test]
+    fn ensure_does_not_change_state_root_permissions() {
+        let tmp = Tmp::new("state-mode");
+        let state_mode = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&tmp.0, state_mode).unwrap();
+        let clipboard = tmp.clipboard();
+
+        clipboard.ensure_at(&tmp.0).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&tmp.0).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(&clipboard.root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(clipboard.root.join(METADATA))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     #[test]
