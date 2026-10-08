@@ -231,6 +231,9 @@
               cargoDebugArtifacts
               reseedTarget
 
+              pkgs.btrfs-progs
+              pkgs.xfsprogs
+
               pkgs.tmux
               pkgs.asciinema
               pkgs.agg
