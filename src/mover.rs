@@ -657,6 +657,45 @@ mod tests {
     }
 
     #[test]
+    fn changing_a_copied_file_keeps_its_source() {
+        let tmp = Tmp::new("changed-file");
+        let src = tmp.0.join("src");
+        let out = tmp.0.join("out");
+        fs::create_dir_all(src.join("inner")).unwrap();
+        fs::write(src.join("inner/f"), b"old").unwrap();
+        fs::create_dir(&out).unwrap();
+
+        let walked = committed(&src, &out);
+        fs::write(src.join("inner/f"), b"new contents").unwrap();
+
+        let failures = remove_moved_source(&src, &walked).unwrap_err();
+        assert_eq!(fs::read(src.join("inner/f")).unwrap(), b"new contents");
+        assert_eq!(fs::read(out.join("src/inner/f")).unwrap(), b"old");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.path == src.join("inner/f"))
+        );
+    }
+
+    #[test]
+    fn a_changed_regular_file_source_is_kept_after_cross_device_copy() {
+        let tmp = Tmp::new("changed-root-file");
+        let src = tmp.0.join("src");
+        let out = tmp.0.join("out");
+        fs::write(&src, b"old").unwrap();
+        fs::create_dir(&out).unwrap();
+
+        let walked = committed(&src, &out);
+        fs::write(&src, b"new contents").unwrap();
+
+        let failures = remove_moved_source(&src, &walked).unwrap_err();
+        assert_eq!(fs::read(&src).unwrap(), b"new contents");
+        assert_eq!(fs::read(out.join("src")).unwrap(), b"old");
+        assert!(failures.iter().any(|failure| failure.path == src));
+    }
+
+    #[test]
     fn an_unchanged_source_is_removed_after_a_cross_device_copy() {
         let tmp = Tmp::new("unchanged-source");
         let src = tmp.0.join("src");

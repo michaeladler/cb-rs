@@ -74,8 +74,8 @@ pub struct Failure {
 struct Report {
     failures: Mutex<Vec<Failure>>,
     /// `None` unless the caller can use it. A copy has no use for it, so
-    /// recording is not free by default: one `Stat` and a `PathBuf` per
-    /// directory would be spent on nothing.
+    /// recording is not free by default: one `Stat` and a `PathBuf` per source
+    /// entry would be spent on nothing.
     walked: Option<Walked>,
 }
 
@@ -96,6 +96,12 @@ impl Report {
             walked.note(path, st, entries);
         }
     }
+
+    fn note_file(&self, path: &Path, st: &Stat) {
+        if let Some(walked) = &self.walked {
+            walked.note_file(path, st);
+        }
+    }
 }
 
 /// One source directory, as the walk saw it.
@@ -105,34 +111,60 @@ struct Seen {
     entries: usize,
 }
 
+/// One source regular file, as the copy opened it.
+struct SeenFile {
+    path: PathBuf,
+    st: Stat,
+}
+
 /// What the copy saw of the source tree, so the caller can tell whether the
 /// source still holds what was copied.
 #[derive(Clone, Default)]
-pub struct Walked(Arc<Mutex<Vec<Seen>>>);
+pub struct Walked {
+    directories: Arc<Mutex<Vec<Seen>>>,
+    files: Arc<Mutex<Vec<SeenFile>>>,
+}
 
 impl Walked {
     fn note(&self, path: &Path, st: &Stat, entries: usize) {
-        self.0.lock().unwrap().push(Seen {
+        self.directories.lock().unwrap().push(Seen {
             path: path.to_path_buf(),
             st: *st,
             entries,
         });
     }
 
-    /// The source directories that no longer hold what the copy took: gone,
+    fn note_file(&self, path: &Path, st: &Stat) {
+        self.files.lock().unwrap().push(SeenFile {
+            path: path.to_path_buf(),
+            st: *st,
+        });
+    }
+
+    /// The source entries that no longer hold what the copy took: gone,
     /// swapped for another inode, or changed inside.
     ///
     /// A cross-device move deletes the source only when this is empty. Anything
-    /// written into the source after the walk read a directory was never
-    /// copied, and deleting the source would lose it.
+    /// written into the source after the walk read an entry was never copied,
+    /// and deleting the source would lose it.
     pub fn changed(&self) -> Vec<PathBuf> {
-        self.0
+        let mut changed = self
+            .directories
             .lock()
             .unwrap()
             .iter()
             .filter(|seen| !unchanged(seen))
             .map(|seen| seen.path.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        changed.extend(
+            self.files
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|seen| !unchanged_file(seen))
+                .map(|seen| seen.path.clone()),
+        );
+        changed
     }
 }
 
@@ -163,6 +195,22 @@ fn unchanged(seen: &Seen) -> bool {
     // same tick as the `readdir` leaves it untouched. The entry count is what
     // catches that one.
     count_entries(&fd) == Some(seen.entries)
+}
+
+fn unchanged_file(seen: &SeenFile) -> bool {
+    let Ok(fd) = open_regular(CWD, &seen.path) else {
+        return false;
+    };
+    let Ok(st) = rustix::fs::fstat(&fd) else {
+        return false;
+    };
+    st.st_dev == seen.st.st_dev
+        && st.st_ino == seen.st.st_ino
+        && st.st_mtime == seen.st.st_mtime
+        && st.st_mtime_nsec == seen.st.st_mtime_nsec
+        && st.st_ctime == seen.st.st_ctime
+        && st.st_ctime_nsec == seen.st.st_ctime_nsec
+        && st.st_size == seen.st.st_size
 }
 
 fn count_entries(dir_fd: &OwnedFd) -> Option<usize> {
@@ -294,7 +342,7 @@ fn copy_tree(src: &Path, dst: &Path, walked: Option<&Walked>) -> Vec<Failure> {
             }
         }
         FileType::RegularFile => {
-            if let Err(e) = copy_regular_path(src, dst) {
+            if let Err(e) = copy_regular_path(src, dst, &report) {
                 report.fail(src, e);
             }
         }
@@ -604,7 +652,7 @@ fn handle_entry(
 
     let result = match file_type {
         FileType::Symlink => copy_symlink(src_fd, name, dst_fd, name),
-        FileType::RegularFile => copy_regular(src_fd, name, dst_fd, name),
+        FileType::RegularFile => copy_regular(src_fd, name, dst_fd, name, &src_path, report),
         other => match statat(src_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(st) => replace_entry(dst_fd, name, |tmp| {
                 mknodat(
@@ -1067,9 +1115,12 @@ fn copy_regular(
     src_name: &CStr,
     dst_dir: &OwnedFd,
     dst_name: &CStr,
+    src_path: &Path,
+    report: &Report,
 ) -> IoResult<()> {
     let src_fd = open_regular(src_dir, src_name)?;
     let st = rustix::fs::fstat(&src_fd)?;
+    report.note_file(src_path, &st);
     replace_entry(dst_dir, dst_name, |tmp| {
         let dst_fd = openat(
             dst_dir,
@@ -1109,9 +1160,10 @@ fn copy_symlink_path(src: &Path, dst: &Path) -> IoResult<()> {
     })
 }
 
-fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
+fn copy_regular_path(src: &Path, dst: &Path, report: &Report) -> IoResult<()> {
     let src_fd = open_regular(CWD, src)?;
     let st = rustix::fs::fstat(&src_fd)?;
+    report.note_file(src, &st);
     replace_entry_path(dst, |tmp| {
         let dst_fd = rustix::fs::open(
             tmp,
@@ -1292,7 +1344,14 @@ mod tests {
         mknodat(&src_dir, c"p", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
 
         assert_eq!(
-            copy_regular(&src_dir, c"p", &dst_dir, c"p"),
+            copy_regular(
+                &src_dir,
+                c"p",
+                &dst_dir,
+                c"p",
+                &tmp.path("src/p"),
+                &Report::default(),
+            ),
             Err(Errno::INVAL)
         );
         assert_eq!(fs::read_dir(tmp.path("dst")).unwrap().count(), 0);
@@ -1307,7 +1366,15 @@ mod tests {
         fs::write(tmp.path("src/f"), b"payload").unwrap();
         mknodat(&dst_dir, c"p", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
 
-        copy_regular(&src_dir, c"f", &dst_dir, c"p").unwrap();
+        copy_regular(
+            &src_dir,
+            c"f",
+            &dst_dir,
+            c"p",
+            &tmp.path("src/f"),
+            &Report::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read(tmp.path("dst/p")).unwrap(),
