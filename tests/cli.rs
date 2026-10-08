@@ -62,6 +62,17 @@ fn version_is_reported() {
 }
 
 #[test]
+fn version_flags_after_command_options_are_not_version_requests() {
+    let got = expect(&["copy", "--", "-V"], 1);
+    assert!(!got.stdout.contains("cb-rs "), "{got:?}");
+    assert!(got.stderr.starts_with("cb: "), "{got:?}");
+
+    let got = expect(&["-n", "-V", "list"], 0);
+    assert!(got.stdout.is_empty(), "{got:?}");
+    assert!(got.stderr.is_empty(), "{got:?}");
+}
+
+#[test]
 fn help_is_reported_for_the_top_level_and_every_subcommand() {
     for args in [
         vec!["--help"],

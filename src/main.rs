@@ -148,12 +148,12 @@ fn normalise(argv: Vec<String>) -> Vec<String> {
 /// every usage error, where cb has always exited 2. `EarlyExit` carries the
 /// message and whether it was an error, so both are handled here.
 fn parse_args(argv: Vec<String>) -> Result<Cli, ExitCode> {
-    let argv = normalise(argv);
-    if argv.iter().any(|a| a == "--version" || a == "-V") {
+    if argv.first().is_some_and(|a| a == "--version" || a == "-V") {
         let mut stdout = std::io::stdout();
         let _ = writeln!(stdout, "cb-rs {}", env!("CARGO_PKG_VERSION"));
         return Err(ExitCode::SUCCESS);
     }
+    let argv = normalise(argv);
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     match Cli::from_args(&["cb"], &argv) {
         Ok(cli) => Ok(cli),
