@@ -27,6 +27,13 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
     let name = src.file_name().ok_or(Errno::INVAL)?;
     let dst = dst_dir.join(name);
 
+    // Pasting into the folder the source already lives in. `renameat2` reports
+    // `EXIST`, and with `--on-conflict replace` that would empty the source
+    // before a rename that then does nothing.
+    if walk::same_file(src, &dst).unwrap_or(false) {
+        return Ok(Outcome::Skipped);
+    }
+
     match rename_noreplace(src, &dst) {
         Ok(()) => return Ok(Outcome::Moved),
         Err(Errno::EXIST | Errno::NOTEMPTY | Errno::ISDIR) => {

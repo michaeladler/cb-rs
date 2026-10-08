@@ -73,9 +73,13 @@ struct Report {
 
 impl Report {
     fn fail(&self, path: &Path, errno: Errno) {
+        self.reject(path, &errno.to_string());
+    }
+
+    fn reject(&self, path: &Path, reason: &str) {
         self.failures.lock().unwrap().push(Failure {
             path: path.to_path_buf(),
-            reason: errno.to_string(),
+            reason: reason.to_owned(),
         });
     }
 
@@ -87,14 +91,35 @@ impl Report {
 /// Copy `src` to `dst` (creating it), recursing into directories in parallel.
 /// Returns every entry that could not be copied.
 pub fn copy_any(src: &Path, dst: &Path) -> Vec<Failure> {
+    let report = Arc::new(Report::default());
+    if same_file(src, dst).unwrap_or(false) {
+        report.reject(src, "source and destination are the same file");
+        return report.take();
+    }
     crate::progress::track(src, || copy_tree(src, dst))
+}
+
+/// Whether two paths name the same inode, no final symlink followed.
+///
+/// Pasting into the folder an item already lives in makes the destination the
+/// source: the copy would truncate the file it is reading, and the move would
+/// empty the directory it is moving.
+pub fn same_file(a: &Path, b: &Path) -> IoResult<bool> {
+    let (a, b) = (
+        statat(CWD, a, AtFlags::SYMLINK_NOFOLLOW)?,
+        statat(CWD, b, AtFlags::SYMLINK_NOFOLLOW)?,
+    );
+    Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Vec<Failure> {
     let report = Arc::new(Report::default());
-    let Ok(st) = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW) else {
-        report.fail(src, Errno::NOENT);
-        return report.take();
+    let st = match statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => st,
+        Err(e) => {
+            report.fail(src, e);
+            return report.take();
+        }
     };
 
     match FileType::from_raw_mode(st.st_mode) {

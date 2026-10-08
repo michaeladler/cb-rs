@@ -173,6 +173,37 @@ fn move_leaves_source_intact_when_the_copy_cannot_complete() {
     );
 }
 
+/// `cut f` in the folder that holds `f`, then `paste` there: the destination is
+/// the source. The replace policy used to empty the source before a rename that
+/// does nothing.
+#[test]
+fn move_into_the_folder_the_source_lives_in_keeps_the_file() {
+    let sandbox = Sandbox::new("self-move");
+    let src = sandbox.write("file.txt", b"payload");
+    let dst_dir = src.parent().unwrap().to_path_buf();
+
+    let outcome = move_into(&src, &dst_dir, Policy::Replace).unwrap();
+
+    assert!(
+        matches!(outcome, Outcome::Skipped),
+        "a paste onto the source itself must be a no-op"
+    );
+    assert_eq!(fs::read(&src).unwrap(), b"payload");
+}
+
+/// The same for a copy: `copy_regular_path(src, src)` opens the destination
+/// `O_TRUNC`, so the file is emptied before it is read.
+#[test]
+fn copy_into_the_folder_the_source_lives_in_keeps_the_file() {
+    let sandbox = Sandbox::new("self-copy");
+    let src = sandbox.write("file.txt", b"payload");
+
+    let failures = copy_any(&src, &src);
+
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(fs::read(&src).unwrap(), b"payload");
+}
+
 #[test]
 fn move_uses_rename_and_leaves_no_source() {
     let sandbox = Sandbox::new("move-rename");
