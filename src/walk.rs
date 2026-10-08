@@ -43,9 +43,15 @@ fn mknodat<P: rustix::path::Arg, Fd: rustix::fd::AsFd>(
     };
 
     path.into_with_c_str(|path| {
-        let mut full = dir.clone();
-        full.push(b'/');
-        full.extend_from_slice(path.to_bytes());
+        let bytes = path.to_bytes();
+        let full = if bytes.starts_with(b"/") {
+            bytes.to_vec()
+        } else {
+            let mut full = dir.clone();
+            full.push(b'/');
+            full.extend_from_slice(bytes);
+            full
+        };
         let Ok(full) = CString::new(full) else {
             return Err(Errno::INVAL);
         };

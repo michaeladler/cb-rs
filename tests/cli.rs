@@ -213,7 +213,12 @@ impl Sandbox {
         std::fs::write(root.join("work/moved.txt"), b"m").unwrap();
         std::fs::create_dir_all(root.join("work/kept")).unwrap();
         std::fs::write(root.join("work/kept/k.txt"), b"k").unwrap();
-        Self { root }
+        // cb records canonicalized paths, and on macOS the temp dir sits under
+        // the `/var` symlink to `/private/var`, so only the resolved root
+        // matches what `list` prints.
+        Self {
+            root: std::fs::canonicalize(root).unwrap(),
+        }
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {

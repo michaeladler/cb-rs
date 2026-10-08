@@ -88,7 +88,7 @@ Read these before pointing `cb-rs` at anything you care about.
 - Only permission bits are preserved. Hardlinks, ownership, timestamps, xattrs, ACLs, and sparse holes are not.
 - Symlinks are recreated, never followed. A tree whose links point outside itself pastes links that may dangle until the destination has them too.
 - Failures are per entry and do not abort the run. The count is printed and the exit status is 1, but the remaining items still move.
-- macOS loses fifos and device nodes. There is no `mknodat` there, so those entries fail; and only the streaming rung of the copy ladder is compiled in, so big-file copies there are at `cb` parity, not better.
+- macOS lacks `mknodat`; fifo and device-node creation uses path-based `mknod` and can fail where OS permissions deny it. Only the streaming rung of the copy ladder is compiled in, so big-file copies there are at `cb` parity, not better.
 - The clipboard is not shared with the C++ `cb`. Not the contents and not the directory. See [State](#state).
 
 ## Clipboards
