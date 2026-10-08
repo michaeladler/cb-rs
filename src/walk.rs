@@ -19,6 +19,11 @@ use rustix::path::Arg;
 #[cfg(not(target_vendor = "apple"))]
 use rustix::fs::mknodat;
 
+/// `openat2` is Linux-only, and refusing a symlink in any component of the path
+/// is what `open_dir` needs it for.
+#[cfg(target_os = "linux")]
+use rustix::fs::{ResolveFlags, openat2};
+
 /// macOS has no `mknodat` — it was never taken up by the BSDs — and rustix
 /// ships no path-based `mknod` to fall back on, so go through libc's `mknod`
 /// on a path. `getpath` recovers the directory an fd names, which is what the
@@ -711,13 +716,8 @@ pub fn sync_tree(path: &Path) -> IoResult<()> {
     let st = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)?;
     match FileType::from_raw_mode(st.st_mode) {
         FileType::Directory => {
-            let dir = openat(
-                CWD,
-                path,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )?;
-            sync_dir(&dir)
+            let (dir_fd, name) = anchor(path)?;
+            sync_dir(&dir_fd, &name)
         }
         FileType::RegularFile => {
             // `NOFOLLOW`: a symlink swapped in since the `statat` must fail here
@@ -729,49 +729,171 @@ pub fn sync_tree(path: &Path) -> IoResult<()> {
     }
 }
 
-fn sync_dir<Fd: AsFd + Copy>(dir_fd: Fd) -> IoResult<()> {
-    let mut dir = Dir::read_from(dir_fd)?;
+/// One step of a walk over a tree: `Enter` opens a directory and queues what is
+/// under it, `Leave` comes back to it once everything below it is done.
+///
+/// A stack on the heap rather than the call stack, and one directory open at a
+/// time: a recursion holds a frame and a descriptor per level, and a tree deep
+/// enough to run out of either takes the walk down with no way to say which
+/// directory it gave up on.
+enum Step {
+    Enter(CString),
+    Leave(CString),
+}
+
+/// `rel` plus one entry name. `readdir` names hold neither `/` nor NUL, so the
+/// joined path names exactly one thing below `rel`.
+fn below(rel: &CStr, name: &CStr) -> CString {
+    let mut bytes = Vec::with_capacity(rel.to_bytes().len() + 1 + name.to_bytes().len());
+    bytes.extend_from_slice(rel.to_bytes());
+    bytes.push(b'/');
+    bytes.extend_from_slice(name.to_bytes());
+    // Unreachable: the name came out of a directory listing.
+    CString::new(bytes).unwrap_or_else(|_| name.to_owned())
+}
+
+/// Open `rel` under `dir_fd` as a directory to walk.
+///
+/// The anchor descriptor plus a relative path is what keeps a walk to a single
+/// open directory at a time; a chain of descriptors down the tree runs out of
+/// `RLIMIT_NOFILE` first, and on a tree deep enough to hit it the walk stops
+/// without saying where.
+fn open_dir<Fd: AsFd>(dir_fd: &Fd, rel: &CStr) -> IoResult<OwnedFd> {
+    let oflags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    // `O_NOFOLLOW` covers the last component only, so a directory swapped for a
+    // symlink higher in `rel` would send the walk somewhere else entirely.
+    #[cfg(target_os = "linux")]
+    match openat2(
+        dir_fd,
+        rel,
+        oflags,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS,
+    ) {
+        // A kernel older than 5.6 has no `openat2`, and one that has it without
+        // `RESOLVE_NO_SYMLINKS` answers `EINVAL`.
+        // ponytail: there, and on every platform but Linux, `O_NOFOLLOW` alone
+        // applies, so a swap higher in `rel` can still redirect a walk. Upgrade
+        // path: `openat2`, where the kernel has it.
+        Err(Errno::NOSYS | Errno::INVAL) => openat(dir_fd, rel, oflags, Mode::empty()),
+        other => other,
+    }
+    #[cfg(not(target_os = "linux"))]
+    openat(dir_fd, rel, oflags, Mode::empty())
+}
+
+/// Entry names in `dir_fd`, `.` and `..` skipped. A `readdir` that fails part-way
+/// has names it never yielded, so the failure goes in `first_err`: answering
+/// "no entries" there is what lets a move report a tree it never saw whole.
+fn entry_names<Fd: AsFd>(dir_fd: Fd, first_err: &mut Option<Errno>) -> Vec<CString> {
     let mut names = Vec::new();
-    for entry in dir.by_ref() {
-        // Same as the walk: a `readdir` that fails part-way leaves names that
-        // were never listed, so the destination is not the whole tree. Answering
-        // `Ok` here is what lets the move unlink the source anyway.
-        let entry = entry?;
+    let dir = match Dir::read_from(dir_fd) {
+        Ok(dir) => dir,
+        Err(e) => {
+            first_err.get_or_insert(e);
+            return names;
+        }
+    };
+    for entry in dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                first_err.get_or_insert(e);
+                break;
+            }
+        };
         let name = entry.file_name();
         if name == c"." || name == c".." {
             continue;
         }
         names.push(name.to_owned());
     }
-    for name in &names {
-        match statat(dir_fd, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) => match FileType::from_raw_mode(st.st_mode) {
-                FileType::Directory => {
-                    let child = openat(
-                        dir_fd,
-                        name.as_c_str(),
-                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                        Mode::empty(),
-                    )?;
-                    sync_dir(&child)?;
-                }
-                FileType::RegularFile => {
-                    let file = openat(
-                        dir_fd,
-                        name.as_c_str(),
-                        OFlags::RDONLY | OFlags::NOFOLLOW,
-                        Mode::empty(),
-                    )?;
-                    copy::commit(&file)?;
-                }
-                _ => {}
-            },
-            // Raced with a deletion in the copy that produced this tree.
-            Err(Errno::NOENT) => {}
-            Err(e) => return Err(e),
+    names
+}
+
+/// The directory holding `path`, and `path`'s own name inside it: the anchor a
+/// walk below is held to.
+///
+/// The parent resolves with ordinary path semantics, so a symlinked directory
+/// on the way to `path` is followed, as the user's path means it. Everything
+/// under that name is reached from the descriptor instead.
+fn anchor(path: &Path) -> IoResult<(OwnedFd, CString)> {
+    // The name came from the filesystem or the command line, so it cannot hold
+    // a NUL: the one thing the `*at` calls cannot carry.
+    let name = path
+        .file_name()
+        .ok_or(Errno::INVAL)
+        .and_then(|name| CString::new(name.as_bytes()).map_err(|_| Errno::INVAL))?;
+    let parent = path.parent().ok_or(Errno::INVAL)?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let dir_fd = openat(
+        CWD,
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    )?;
+    Ok((dir_fd, name))
+}
+
+/// fsync `rel` under `dir_fd` and everything under it, one directory open at a
+/// time.
+fn sync_dir<Fd: AsFd>(dir_fd: &Fd, rel: &CStr) -> IoResult<()> {
+    let mut stack = vec![Step::Enter(rel.to_owned())];
+    while let Some(step) = stack.pop() {
+        let rel = match step {
+            Step::Leave(rel) => {
+                let fd = match open_dir(dir_fd, &rel) {
+                    Ok(fd) => fd,
+                    // Raced with a deletion in the copy that produced this tree:
+                    // there is nothing left under the name to flush.
+                    Err(Errno::NOENT) => continue,
+                    Err(e) => return Err(e),
+                };
+                copy::commit(&fd)?;
+                continue;
+            }
+            Step::Enter(rel) => rel,
+        };
+        let dir = open_dir(dir_fd, &rel)?;
+        let mut read_err = None;
+        let names = entry_names(&dir, &mut read_err);
+        // Same as the walk: a `readdir` that fails part-way leaves names that
+        // were never listed, so the destination is not the whole tree. Answering
+        // `Ok` here is what lets the move unlink the source anyway.
+        if let Some(e) = read_err {
+            return Err(e);
         }
+        let mut subdirs = Vec::new();
+        for name in &names {
+            match statat(&dir, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => match FileType::from_raw_mode(st.st_mode) {
+                    FileType::Directory => subdirs.push(below(&rel, name.as_c_str())),
+                    FileType::RegularFile => {
+                        let file = openat(
+                            &dir,
+                            name.as_c_str(),
+                            OFlags::RDONLY | OFlags::NOFOLLOW,
+                            Mode::empty(),
+                        )?;
+                        copy::commit(&file)?;
+                    }
+                    _ => {}
+                },
+                // Raced with a deletion in the copy that produced this tree.
+                Err(Errno::NOENT) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Below first, this directory last: a name is only durable once what it
+        // points at is.
+        stack.push(Step::Leave(rel));
+        stack.extend(subdirs.into_iter().map(Step::Enter));
     }
-    copy::commit(&dir_fd)
+    Ok(())
 }
 
 /// Open a source that was classified as a regular file, and check it still is.
@@ -919,84 +1041,90 @@ fn copy_other_path(src: &Path, dst: &Path, file_type: FileType) -> IoResult<()> 
 /// Remove a tree bottom-up. Only used to finish a move that `renameat2` could
 /// not perform because the two paths are on different filesystems.
 pub fn remove_any(path: &Path) -> IoResult<()> {
-    let name = path.file_name().ok_or(Errno::INVAL)?;
-    let parent = path.parent().ok_or(Errno::INVAL)?;
-    if parent.as_os_str().is_empty() {
-        return remove_entry(CWD, name);
-    }
-    // The parent is held open for the whole delete: every operation below is
-    // relative to this fd, so a directory higher up that is swapped for a
-    // symlink after the open cannot redirect the delete. The parent itself
-    // still resolves with ordinary path semantics, so a symlink in the way
-    // is followed, as the user's path means it.
-    let dir_fd = match openat(
-        CWD,
-        parent,
-        OFlags::RDONLY | OFlags::DIRECTORY,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
+    let (dir_fd, name) = match anchor(path) {
+        Ok(anchor) => anchor,
+        // Nothing to remove, and nothing that ever was.
         Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(e),
     };
-    remove_entry(&dir_fd, name)
+    remove_entry(&dir_fd, &name)
 }
 
-fn remove_entry<Fd: AsFd + Copy, P: Arg + Copy>(dir_fd: Fd, name: P) -> IoResult<()> {
-    let st = match statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(st) => st,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
-        return unlinkat(dir_fd, name, AtFlags::empty());
-    }
-    // `NOFOLLOW`: a symlink swapped in at `name` must fail the open rather
-    // than send the recursive delete into whatever it points at.
-    let child_fd = openat(
-        dir_fd,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )?;
-    let _ = remove_children(&child_fd);
-    unlinkat(dir_fd, name, AtFlags::REMOVEDIR)
-}
-
-/// Remove every entry under an open directory fd, recursing into real
-/// directories. Names resolve against the fd rather than the filesystem, so a
-/// directory swapped for a symlink mid-walk cannot redirect the delete into
-/// its target.
-pub fn remove_children<Fd: AsFd + Copy>(dir_fd: Fd) -> IoResult<()> {
+/// Remove `rel` under `dir_fd` and everything under it, bottom-up, one
+/// directory open at a time.
+///
+/// What is not a directory goes while its own directory is still open, by name
+/// in that directory: the anchor and a relative path are enough to reach a
+/// directory safely, but not to unlink from a level the walk has left.
+fn remove_entry<Fd: AsFd>(dir_fd: &Fd, rel: &CStr) -> IoResult<()> {
     let mut first_err = None;
-    let mut dir = Dir::read_from(dir_fd)?;
-    let mut names = Vec::new();
-    for entry in dir.by_ref() {
-        // A `readdir` that fails part-way has names it never yielded; they are
-        // still deleted by the caller's next attempt, but the failure has to
-        // reach it, or the move that owns this delete reports a tree it did
-        // not remove as removed.
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
+    let mut stack = vec![Step::Enter(rel.to_owned())];
+    while let Some(step) = stack.pop() {
+        let rel = match step {
+            Step::Leave(rel) => {
+                // Empty by now, so the name itself can go. `NOENT` is a
+                // directory that was never there.
+                match unlinkat(dir_fd, &rel, AtFlags::REMOVEDIR) {
+                    Err(Errno::NOENT) => {}
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                    }
+                    Ok(()) => {}
                 }
-                break;
+                continue;
+            }
+            Step::Enter(rel) => rel,
+        };
+        let st = match statat(dir_fd, &rel, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(Errno::NOENT) => continue,
+            Err(e) => {
+                first_err.get_or_insert(e);
+                continue;
             }
         };
-        let name = entry.file_name();
-        if name == c"." || name == c".." {
+        if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
+            if let Err(e) = unlinkat(dir_fd, &rel, AtFlags::empty()) {
+                first_err.get_or_insert(e);
+            }
             continue;
         }
-        names.push(name.to_owned());
-    }
-    for name in &names {
-        if let Err(e) = remove_entry(dir_fd, name.as_c_str())
-            && first_err.is_none()
-        {
-            first_err = Some(e);
+        let mut subdirs = Vec::new();
+        match open_dir(dir_fd, &rel) {
+            Ok(dir) => {
+                let mut read_err = None;
+                let names = entry_names(&dir, &mut read_err);
+                // A `readdir` that fails part-way has names it never yielded,
+                // but the ones it did yield still go: leaving them is what makes
+                // the leftover worse than the failure already is.
+                if let Some(e) = read_err {
+                    first_err.get_or_insert(e);
+                }
+                for name in &names {
+                    match statat(&dir, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                        Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Directory => {
+                            subdirs.push(below(&rel, name.as_c_str()));
+                        }
+                        // Raced with a deletion: there is nothing left to unlink.
+                        Err(Errno::NOENT) => {}
+                        Ok(_) => {
+                            if let Err(e) = unlinkat(&dir, name.as_c_str(), AtFlags::empty()) {
+                                first_err.get_or_insert(e);
+                            }
+                        }
+                        Err(e) => {
+                            first_err.get_or_insert(e);
+                        }
+                    }
+                }
+            }
+            // The cause, not the `ENOTEMPTY` the `rmdir` below would answer.
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
         }
+        stack.push(Step::Leave(rel));
+        stack.extend(subdirs.into_iter().map(Step::Enter));
     }
     match first_err {
         Some(e) => Err(e),
@@ -1228,6 +1356,21 @@ mod tests {
         );
     }
 
+    /// The parent resolves the way the user's path means it: a symlinked
+    /// directory on the way to the tree is followed, not refused.
+    #[test]
+    fn remove_any_follows_a_symlink_on_the_way_to_the_tree() {
+        let tmp = Tmp::new("rm-link-parent");
+        fs::create_dir_all(tmp.path("real/tree")).unwrap();
+        fs::write(tmp.path("real/tree/f"), b"x").unwrap();
+        symlink(tmp.path("real"), tmp.path("link")).unwrap();
+
+        remove_any(&tmp.path("link/tree")).unwrap();
+
+        assert!(!tmp.path("real/tree").exists());
+        assert!(tmp.path("real").exists());
+    }
+
     #[test]
     fn copy_symlink_missing_source_reports_noent() {
         let tmp = Tmp::new("sym-missing");
@@ -1346,8 +1489,8 @@ mod tests {
         let tmp = Tmp::new("readdir-fail");
         let file = File::create(tmp.path("f")).unwrap();
 
-        assert_eq!(sync_dir(&file).unwrap_err(), Errno::NOTDIR);
-        assert_eq!(remove_children(&file).unwrap_err(), Errno::NOTDIR);
+        assert_eq!(sync_dir(&file, c"f").unwrap_err(), Errno::NOTDIR);
+        assert_eq!(remove_entry(&file, c"f").unwrap_err(), Errno::NOTDIR);
     }
 
     /// The walk's own directory open is the one failure a copy reports for every
@@ -1464,7 +1607,7 @@ mod tests {
         let status = std::process::Command::new(&bin)
             .env("CB_WIDE_FDS_REEXEC", "1")
             .arg("--exact")
-            .arg("copy_wide_directory_stays_under_the_fd_limit")
+            .arg("walk::tests::copy_wide_directory_stays_under_the_fd_limit")
             .status()
             .unwrap();
         assert!(status.success(), "the re-exec'd copy failed: {status}");
@@ -1502,6 +1645,62 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
         let count = fs::read_dir(&dst).unwrap().count();
         assert_eq!(count, usize::try_from(dirs).unwrap());
+    }
+
+    /// The sync and the delete walked one directory per descriptor held open, so
+    /// a tree deeper than `RLIMIT_NOFILE` stopped them mid-tree and reported a
+    /// failure with the rest of the source still there.
+    #[test]
+    fn a_deep_tree_stays_under_the_fd_limit() {
+        // The lowered limit is per-process, so for the same reason as the walk's
+        // own it lives in a re-exec of this binary.
+        if std::env::var_os("CB_DEEP_FDS_REEXEC").is_some() {
+            deep_fds_child();
+            return;
+        }
+        let bin = std::env::args().next().expect("test binary path");
+        let status = std::process::Command::new(&bin)
+            .env("CB_DEEP_FDS_REEXEC", "1")
+            .arg("--exact")
+            .arg("walk::tests::a_deep_tree_stays_under_the_fd_limit")
+            .status()
+            .unwrap();
+        assert!(status.success(), "the re-exec'd walk failed: {status}");
+    }
+
+    fn deep_fds_child() {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+        let tmp = Tmp::new("deep-fds");
+        let root = tmp.path("tree");
+        let depth = 256u32;
+        fs::create_dir(&root).unwrap();
+        let mut path = root.clone();
+        for _ in 0..depth {
+            path = path.join("d");
+            fs::create_dir(&path).unwrap();
+        }
+        fs::write(path.join("f"), b"x").unwrap();
+
+        let old = getrlimit(Resource::Nofile);
+        // One directory at a time, plus the anchor and the listing: `depth`
+        // descriptors held open at once would breach this early.
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(32),
+                maximum: old.maximum,
+            },
+        )
+        .unwrap();
+
+        let synced = sync_tree(&root);
+        let removed = remove_any(&root);
+        setrlimit(Resource::Nofile, old).unwrap();
+
+        synced.unwrap();
+        removed.unwrap();
+        assert!(!root.exists(), "the deep tree must be gone whole");
     }
 
     #[test]

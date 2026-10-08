@@ -90,19 +90,31 @@ fn style(template: &str) -> ProgressStyle {
 /// Bytes `clone_file` will move for `path`: regular file sizes only, symlinks
 /// not followed. Unreadable entries count 0; the copy reports them. `None`
 /// once `stop` is set.
+///
+/// An explicit stack, so a deep tree costs heap rather than the call stack, and
+/// one directory open at a time: this runs beside the copy, which is the one
+/// thing that cannot afford to run out of descriptors on its own account.
 fn tree_size(path: &Path, stop: &AtomicBool) -> Option<u64> {
-    if stop.load(Relaxed) {
-        return None;
-    }
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return Some(0);
-    };
-    if !meta.is_dir() {
-        return Some(if meta.is_file() { meta.len() } else { 0 });
-    }
     let mut size = 0;
-    for entry in std::fs::read_dir(path).into_iter().flatten().flatten() {
-        size += tree_size(&entry.path(), stop)?;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        if stop.load(Relaxed) {
+            return None;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            size += if meta.is_file() { meta.len() } else { 0 };
+            continue;
+        }
+        stack.extend(
+            std::fs::read_dir(&path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path()),
+        );
     }
     Some(size)
 }
