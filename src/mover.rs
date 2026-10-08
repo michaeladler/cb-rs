@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, CWD, RenameFlags, linkat, renameat, renameat_with, statat, unlinkat};
 use rustix::io::{Errno, Result as IoResult};
@@ -11,6 +11,16 @@ use crate::walk;
 use crate::walk::{Failure, Walked};
 
 type DestinationIdentity = (u128, u128);
+
+#[derive(Debug)]
+enum ReplaceError {
+    Io(Errno),
+    Restore {
+        replace: Errno,
+        restore: Errno,
+        parked: PathBuf,
+    },
+}
 
 /// What became of one move attempt.
 #[derive(Debug, PartialEq, Eq)]
@@ -61,7 +71,7 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
             }
             return replace_by_rename(src, &dst)
                 .map(|()| Outcome::Moved)
-                .map_err(|e| one(src, e));
+                .map_err(|e| replace_failure(src, e));
         }
         // Cross-device, or no `renameat2`: fall back to copy-then-delete.
         // `EINVAL` is deliberately not here: it is what `rename` answers when
@@ -189,12 +199,29 @@ fn copy_then_commit(
     {
         return Ok(Outcome::Skipped);
     }
-    replace_by_rename(staged, dst).map_err(|e| one(src, e))?;
+    replace_by_rename(staged, dst).map_err(|e| replace_failure(src, e))?;
     // The whole tree, then the parent: a crash after the source is unlinked must
     // find the destination readable, contents included, and holding the name.
     walk::sync_tree(dst).map_err(|e| one(src, e))?;
     sync_parent(dst).map_err(|e| one(src, e))?;
     Ok(Outcome::Moved)
+}
+
+fn replace_failure(src: &Path, error: ReplaceError) -> Vec<Failure> {
+    match error {
+        ReplaceError::Io(error) => one(src, error),
+        ReplaceError::Restore {
+            replace,
+            restore,
+            parked,
+        } => vec![Failure {
+            path: src.to_path_buf(),
+            reason: format!(
+                "{replace}; failed to restore previous destination ({restore}), data remains at {}",
+                parked.display()
+            ),
+        }],
+    }
 }
 
 /// One entry, for a failure that is about `path` rather than about one file
@@ -259,25 +286,25 @@ fn destination_identity(path: &Path) -> IoResult<Option<DestinationIdentity>> {
 /// file `ENOTDIR`, and neither `EACCES` nor a read-only filesystem is worth
 /// betting a tree on. Moving the old destination aside instead keeps it until
 /// the rename lands, and puts it back if the rename does not.
-fn replace_by_rename(src: &Path, dst: &Path) -> IoResult<()> {
-    if !exists(dst)? {
-        return rustix::fs::rename(src, dst);
+fn replace_by_rename(src: &Path, dst: &Path) -> Result<(), ReplaceError> {
+    if !exists(dst).map_err(ReplaceError::Io)? {
+        return rustix::fs::rename(src, dst).map_err(ReplaceError::Io);
     }
-    // A private sibling, so the old destination stays on the same filesystem and
-    // the rename that restores it is atomic too.
-    let parked = walk::staged_path(dst)?;
-    renameat(CWD, dst, CWD, &parked)?;
+    let parked = walk::parked_path(dst).map_err(ReplaceError::Io)?;
+    renameat(CWD, dst, CWD, &parked).map_err(ReplaceError::Io)?;
     match rustix::fs::rename(src, dst) {
         Ok(()) => {
             let _ = walk::remove_any(&parked);
             Ok(())
         }
-        Err(e) => {
-            // Best effort: the destination name is free again either way, and a
-            // failure here has already been reported to the caller.
-            let _ = renameat(CWD, &parked, CWD, dst);
-            Err(e)
-        }
+        Err(replace) => match renameat(CWD, &parked, CWD, dst) {
+            Ok(()) => Err(ReplaceError::Io(replace)),
+            Err(restore) => Err(ReplaceError::Restore {
+                replace,
+                restore,
+                parked,
+            }),
+        },
     }
 }
 
@@ -430,9 +457,11 @@ mod tests {
         fs::write(dst.join("keep.txt"), b"keep").unwrap();
         let missing = tmp.0.join("gone");
 
-        assert_eq!(
-            replace_by_rename(&missing, &dst),
-            Err(Errno::NOENT),
+        assert!(
+            matches!(
+                replace_by_rename(&missing, &dst),
+                Err(ReplaceError::Io(Errno::NOENT))
+            ),
             "a missing source cannot be renamed"
         );
 
@@ -443,6 +472,24 @@ mod tests {
         );
         let left: Vec<_> = fs::read_dir(&tmp.0).unwrap().flatten().collect();
         assert_eq!(left.len(), 1, "no parked copy may survive: {left:?}");
+    }
+
+    #[test]
+    fn restore_failure_report_names_parked_destination() {
+        let tmp = Tmp::new("replace-restore-report");
+        let src = tmp.0.join("src");
+        let parked = tmp.0.join("parked");
+        let failures = replace_failure(
+            &src,
+            ReplaceError::Restore {
+                replace: Errno::NOENT,
+                restore: Errno::PERM,
+                parked: parked.clone(),
+            },
+        );
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].reason.contains(&parked.display().to_string()));
     }
 
     /// Plain `rename` will not replace a directory with a file, so the old

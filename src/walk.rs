@@ -5,7 +5,7 @@ use std::sync::atomic::{
     AtomicU32, AtomicUsize,
     Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crossbeam_deque::{Injector, Steal, Worker};
 use rustix::fd::{AsFd, OwnedFd};
@@ -667,39 +667,94 @@ where
 }
 
 static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
+static TEMP_IDENTITY: OnceLock<Option<String>> = OnceLock::new();
 
-/// Private enough that another `cb` will not collide: pid plus per-process counter.
+fn temp_identity() -> Option<&'static str> {
+    TEMP_IDENTITY
+        .get_or_init(|| {
+            let host: String = rustix::system::uname()
+                .nodename()
+                .to_bytes()
+                .iter()
+                .take(32)
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() {
+                        *b as char
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            #[cfg(target_os = "linux")]
+            let (boot_id, pid_namespace) = {
+                let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+                let boot_id = boot_id.trim();
+                if boot_id.is_empty()
+                    || !boot_id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                {
+                    return None;
+                }
+                let namespace = std::fs::read_link("/proc/self/ns/pid").ok()?;
+                let namespace = namespace
+                    .as_os_str()
+                    .as_bytes()
+                    .strip_prefix(b"pid:[")?
+                    .strip_suffix(b"]")?;
+                if namespace.is_empty() || !namespace.iter().all(u8::is_ascii_digit) {
+                    return None;
+                }
+                (
+                    boot_id.to_owned(),
+                    std::str::from_utf8(namespace).ok()?.to_owned(),
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let (boot_id, pid_namespace) = ("host".to_owned(), "host".to_owned());
+            Some(format!("{host}.{boot_id}.{pid_namespace}"))
+        })
+        .as_deref()
+}
+
+/// Private sibling name includes host, boot, PID namespace, PID, and counter.
 fn temp_name(dst_name: &CStr) -> CString {
     CString::new(temp_bytes(dst_name.to_bytes())).unwrap_or_else(|_| c".cb-tmp".to_owned())
 }
 
 fn temp_bytes(dst_name: &[u8]) -> Vec<u8> {
+    named_temp_bytes(".cb-tmp", dst_name)
+}
+
+fn named_temp_bytes(prefix: &str, dst_name: &[u8]) -> Vec<u8> {
     let n = TEMP_SEQ.fetch_add(1, Relaxed);
-    let mut bytes = format!(".cb-tmp.{}.{n}.", std::process::id()).into_bytes();
-    bytes.extend_from_slice(dst_name);
+    let identity = temp_identity().unwrap_or("unknown");
+    let mut bytes = format!("{prefix}.{identity}.{}.{n}.", std::process::id()).into_bytes();
+    // Keep the token plus readable basename fragment below NAME_MAX.
+    bytes.extend_from_slice(&dst_name[..dst_name.len().min(128)]);
     bytes
 }
 
+fn take_temp_field(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = bytes.iter().position(|b| *b == b'.')?;
+    (end != 0).then(|| (&bytes[..end], &bytes[end + 1..]))
+}
+
 fn stale_temp(name: &CStr) -> bool {
-    let Some(rest) = name.to_bytes().strip_prefix(b".cb-tmp.") else {
+    let Some(identity) = temp_identity() else {
         return false;
     };
-    let Some(pid_end) = rest.iter().position(|b| *b == b'.') else {
+    let prefix = format!(".cb-tmp.{identity}.");
+    let Some(rest) = name.to_bytes().strip_prefix(prefix.as_bytes()) else {
         return false;
     };
-    let (pid, rest) = rest.split_at(pid_end);
-    let rest = &rest[1..];
-    let Some(seq_end) = rest.iter().position(|b| *b == b'.') else {
+    let Some((pid, rest)) = take_temp_field(rest) else {
         return false;
     };
-    let (seq, suffix) = rest.split_at(seq_end);
-    let suffix = &suffix[1..];
-    if pid.is_empty()
-        || seq.is_empty()
-        || suffix.is_empty()
+    let Some((seq, suffix)) = take_temp_field(rest) else {
+        return false;
+    };
+    if suffix.is_empty()
         || !pid.iter().all(u8::is_ascii_digit)
         || !seq.iter().all(u8::is_ascii_digit)
-        || suffix.contains(&b'/')
     {
         return false;
     }
@@ -710,7 +765,7 @@ fn stale_temp(name: &CStr) -> bool {
         .is_some_and(|pid| rustix::process::test_kill_process(pid) == Err(Errno::SRCH))
 }
 
-// ponytail: O(entries) scan per touched dir; PID reuse can retain leftovers. Upgrade path: durable manifest.
+// ponytail: O(entries) scan; missing identity or PID reuse can retain temps. Upgrade path: durable manifest.
 fn clean_stale_temps<Fd: AsFd>(dir_fd: &Fd) {
     let Ok(dir) = Dir::read_from(dir_fd) else {
         return;
@@ -741,6 +796,15 @@ pub(crate) fn clean_stale_temps_at_path(path: &Path) {
 pub fn staged_path(path: &Path) -> IoResult<PathBuf> {
     let name = path.file_name().ok_or(Errno::INVAL)?;
     Ok(path.with_file_name(OsStr::from_bytes(&temp_bytes(name.as_bytes()))))
+}
+
+/// A sibling name for a destination parked during replacement, never removed by staging cleanup.
+pub fn parked_path(path: &Path) -> IoResult<PathBuf> {
+    let name = path.file_name().ok_or(Errno::INVAL)?;
+    Ok(path.with_file_name(OsStr::from_bytes(&named_temp_bytes(
+        ".cb-parked",
+        name.as_bytes(),
+    ))))
 }
 
 /// Flush everything under `path`, so a move that unlinks its source cannot lose
@@ -1283,11 +1347,14 @@ mod tests {
     #[test]
     fn stale_temporary_entries_are_cleaned_safely() {
         let tmp = Tmp::new("stale-temps");
-        let stale = tmp.path(&format!(".cb-tmp.{}.1.file", i32::MAX));
-        let live = tmp.path(&format!(".cb-tmp.{}.1.file", std::process::id()));
-        let unrelated = tmp.path(".cb-tmp.bad.1.file");
+        let identity = temp_identity().expect("Linux exposes boot and PID namespace IDs");
+        let stale = tmp.path(&format!(".cb-tmp.{identity}.{i}.1.file", i = i32::MAX));
+        let live = tmp.path(&format!(".cb-tmp.{identity}.{}.1.file", std::process::id()));
+        let other_host = tmp.path(&format!(".cb-tmp.other-host.{i}.1.file", i = i32::MAX));
+        let unrelated = tmp.path(".cb-tmp.123.1.file");
         fs::write(&stale, b"stale").unwrap();
         fs::write(&live, b"live").unwrap();
+        fs::write(&other_host, b"remote").unwrap();
         fs::write(&unrelated, b"keep").unwrap();
         let dir: OwnedFd = File::open(&tmp.0).unwrap().into();
 
@@ -1295,7 +1362,20 @@ mod tests {
 
         assert!(!stale.exists());
         assert!(live.exists());
+        assert!(other_host.exists());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn parked_entries_never_match_stale_temp_cleanup() {
+        let tmp = Tmp::new("parked-temps");
+        let parked = parked_path(&tmp.path("destination")).unwrap();
+        fs::write(&parked, b"old destination").unwrap();
+        let dir: OwnedFd = File::open(&tmp.0).unwrap().into();
+
+        clean_stale_temps(&dir);
+
+        assert_eq!(fs::read(parked).unwrap(), b"old destination");
     }
 
     #[test]
