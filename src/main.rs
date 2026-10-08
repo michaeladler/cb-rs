@@ -7,7 +7,6 @@ use argh::FromArgs;
 use cb_rs::mover;
 use cb_rs::paths::{self, Clipboard};
 use cb_rs::policy::Policy;
-use cb_rs::walk;
 use cb_rs::walk::Failure;
 
 // argh has no global options, so `-n/--name` is declared on the top level and on
@@ -340,8 +339,10 @@ fn paste_moves(
                 skipped += 1;
                 remaining.push(source.clone());
             }
-            Err(e) => {
-                eprintln!("cb: {}: {e}", source.display());
+            Err(failures) => {
+                for failure in &failures {
+                    eprintln!("cb: {}: {}", failure.path.display(), failure.reason);
+                }
                 failed += 1;
                 remaining.push(source.clone());
             }
@@ -371,26 +372,13 @@ fn paste_copies(dst_dir: &Path, policy: Policy, sources: &[PathBuf]) -> Result<(
     let mut skipped = 0usize;
     let mut pasted = 0usize;
     for source in sources {
-        let Some(name) = source.file_name() else {
-            failures.push(Failure {
-                path: source.clone(),
-                reason: "no file name".to_owned(),
-            });
-            continue;
-        };
-        let dst = dst_dir.join(name);
-        // `mover::exists` rather than `Path::exists`, which follows symlinks and
-        // so reports a dangling one as free, then overwrites it.
-        if mover::exists(&dst).map_err(|e| e.to_string())?
-            && !policy.resolve(&dst).map_err(|e| e.to_string())?
-        {
-            skipped += 1;
-            continue;
-        }
-        let before = failures.len();
-        failures.extend(walk::copy_any(source, &dst));
-        if failures.len() == before {
-            pasted += 1;
+        // Staged and renamed in, so a destination that appears between the check
+        // above the copy and the write below it is declined or replaced whole
+        // rather than merged into.
+        match mover::copy_into(source, dst_dir, policy) {
+            Ok(mover::Outcome::Moved) => pasted += 1,
+            Ok(mover::Outcome::Skipped) => skipped += 1,
+            Err(mut copy_failures) => failures.append(&mut copy_failures),
         }
     }
     if skipped > 0 {

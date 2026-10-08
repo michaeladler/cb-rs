@@ -275,9 +275,10 @@ fn move_into_its_own_subtree_is_refused() {
     fs::write(src.join("sub/inner.txt"), b"inner").unwrap();
     let dst_dir = src.join("sub");
 
-    let result = move_into(&src, &dst_dir, Policy::Replace);
+    let failures = move_into(&src, &dst_dir, Policy::Replace).unwrap_err();
 
-    assert_eq!(result, Err(rustix::io::Errno::INVAL));
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0].reason, rustix::io::Errno::INVAL.to_string());
     assert_eq!(fs::read(src.join("sub/inner.txt")).unwrap(), b"inner");
     assert_eq!(
         fs::read_dir(&dst_dir).unwrap().count(),

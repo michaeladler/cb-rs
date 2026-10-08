@@ -8,6 +8,7 @@ use rustix::io::{Errno, Result as IoResult};
 use crate::copy;
 use crate::policy::Policy;
 use crate::walk;
+use crate::walk::Failure;
 
 /// What became of one move attempt.
 #[derive(Debug, PartialEq, Eq)]
@@ -23,8 +24,13 @@ pub enum Outcome {
 /// staging path, rename that onto the destination, and only then unlink the
 /// source. The C++ version deletes originals after a copy it never re-checked,
 /// which loses data if the copy silently came up short.
-pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome> {
-    let name = src.file_name().ok_or(Errno::INVAL)?;
+pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, Vec<Failure>> {
+    let name = src.file_name().ok_or_else(|| {
+        vec![Failure {
+            path: src.to_path_buf(),
+            reason: "no file name".to_owned(),
+        }]
+    })?;
     let dst = dst_dir.join(name);
 
     // Pasting into the folder the source already lives in. `renameat2` reports
@@ -37,16 +43,18 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
     // must not be read as "no renameat2 here" and turned into a copy-then-delete
     // that copies the source into itself until the disk fills.
     if walk::inside_source(src, &dst).unwrap_or(false) {
-        return Err(Errno::INVAL);
+        return Err(one(src, Errno::INVAL));
     }
 
     match rename_noreplace(src, &dst) {
         Ok(()) => return Ok(Outcome::Moved),
         Err(Errno::EXIST | Errno::NOTEMPTY | Errno::ISDIR) => {
-            if !policy.resolve(&dst)? {
+            if !policy.resolve(&dst).map_err(|e| one(src, e))? {
                 return Ok(Outcome::Skipped);
             }
-            return replace_by_rename(src, &dst).map(|()| Outcome::Moved);
+            return replace_by_rename(src, &dst)
+                .map(|()| Outcome::Moved)
+                .map_err(|e| one(src, e));
         }
         // Cross-device, or no `renameat2`: fall back to copy-then-delete.
         // `EINVAL` is deliberately not here: it is what `rename` answers when
@@ -55,21 +63,61 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
         // filesystem-does-not-support-the-flag case is reported by
         // `rename_noreplace` as `OPNOTSUPP`.
         Err(Errno::XDEV | Errno::NOSYS | Errno::OPNOTSUPP) => {}
-        Err(e) => return Err(e),
+        Err(e) => return Err(one(src, e)),
     }
 
     // A cross-device move copies into a private sibling of the destination and
-    // renames that into place, so a destination that appears while the copy
+    // renames that onto place, so a destination that appears while the copy
     // runs is only ever replaced by a finished tree.
-    let staged = walk::staged_path(&dst)?;
+    let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
+    let outcome = stage_and_commit(src, &dst, &staged, policy);
+    if matches!(outcome, Ok(Outcome::Moved)) {
+        // The source goes only after the destination is on disk. A copy that came
+        // up short leaves the source in place, which is the whole point.
+        walk::remove_any(src).map_err(|e| one(src, e))?;
+    }
+    outcome
+}
+
+/// Copy `src` into `dst_dir`, like [`move_into`] but leaving the source alone.
+///
+/// Staged and renamed in like a move, so the policy is consulted against the
+/// destination twice: once before the copy and once after it. A destination that
+/// appears while the copy runs is then either declined or replaced whole, never
+/// merged into.
+pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, Vec<Failure>> {
+    let name = src.file_name().ok_or_else(|| {
+        vec![Failure {
+            path: src.to_path_buf(),
+            reason: "no file name".to_owned(),
+        }]
+    })?;
+    let dst = dst_dir.join(name);
+    if walk::same_file(src, &dst).unwrap_or(false) {
+        return Ok(Outcome::Skipped);
+    }
+    if walk::inside_source(src, &dst).unwrap_or(false) {
+        return Err(vec![Failure {
+            path: src.to_path_buf(),
+            reason: "destination is inside the source".to_owned(),
+        }]);
+    }
+    if exists(&dst).map_err(|e| one(src, e))? && !policy.resolve(&dst).map_err(|e| one(src, e))? {
+        return Ok(Outcome::Skipped);
+    }
+    let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
     stage_and_commit(src, &dst, &staged, policy)
 }
 
-/// Copy `src` to `staged`, then move it onto `dst`. The source is unlinked only
-/// after the destination is on disk. A staged tree that did not reach the
-/// destination is removed here rather than by the caller, which cannot tell
-/// which outcome it got before looking.
-fn stage_and_commit(src: &Path, dst: &Path, staged: &Path, policy: Policy) -> IoResult<Outcome> {
+/// Copy `src` to `staged`, then rename it onto `dst`. A staged tree that did not
+/// reach the destination is removed here rather than by the caller, which cannot
+/// tell which outcome it got before looking.
+fn stage_and_commit(
+    src: &Path,
+    dst: &Path,
+    staged: &Path,
+    policy: Policy,
+) -> Result<Outcome, Vec<Failure>> {
     let result = copy_then_commit(src, dst, staged, policy);
     if !matches!(result, Ok(Outcome::Moved)) {
         let _ = walk::remove_any(staged);
@@ -77,23 +125,36 @@ fn stage_and_commit(src: &Path, dst: &Path, staged: &Path, policy: Policy) -> Io
     result
 }
 
-fn copy_then_commit(src: &Path, dst: &Path, staged: &Path, policy: Policy) -> IoResult<Outcome> {
+fn copy_then_commit(
+    src: &Path,
+    dst: &Path,
+    staged: &Path,
+    policy: Policy,
+) -> Result<Outcome, Vec<Failure>> {
     let failures = walk::copy_any(src, staged);
     if !failures.is_empty() {
-        return Err(Errno::IO);
+        return Err(failures);
     }
     // Re-read rather than trusting the answer from above the copy: the staged
     // tree went in under a private name, so only now does it overwrite.
-    if exists(dst)? && !policy.resolve(dst)? {
+    if exists(dst).map_err(|e| one(src, e))? && !policy.resolve(dst).map_err(|e| one(src, e))? {
         return Ok(Outcome::Skipped);
     }
-    replace_by_rename(staged, dst)?;
+    replace_by_rename(staged, dst).map_err(|e| one(src, e))?;
     // The whole tree, then the parent: a crash after the source is unlinked must
     // find the destination readable, contents included, and holding the name.
-    walk::sync_tree(dst)?;
-    sync_parent(dst)?;
-    walk::remove_any(src)?;
+    walk::sync_tree(dst).map_err(|e| one(src, e))?;
+    sync_parent(dst).map_err(|e| one(src, e))?;
     Ok(Outcome::Moved)
+}
+
+/// One entry, for a failure that is about `path` rather than about one file
+/// inside it.
+fn one(path: &Path, errno: Errno) -> Vec<Failure> {
+    vec![Failure {
+        path: path.to_path_buf(),
+        reason: errno.to_string(),
+    }]
 }
 
 fn rename_noreplace(src: &Path, dst: &Path) -> IoResult<()> {
@@ -197,6 +258,7 @@ fn is_yes(answer: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use crate::policy::Policy;
@@ -349,7 +411,7 @@ mod tests {
         fs::write(&dst, b"old").unwrap();
 
         assert_eq!(
-            stage_and_commit(&src, &dst, &staged, Policy::Skip),
+            stage_and_commit(&src, &dst, &staged, Policy::Skip).map_err(|f| f.len()),
             Ok(Outcome::Skipped)
         );
 
@@ -366,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_and_commit_replaces_a_directory_and_consumes_the_source() {
+    fn stage_and_commit_replaces_a_directory_and_leaves_the_source() {
         let tmp = Tmp::new("stage-commit");
         let src = tmp.0.join("src");
         let dst = tmp.0.join("dst");
@@ -378,18 +440,81 @@ mod tests {
         fs::write(dst.join("stale"), b"old").unwrap();
 
         assert_eq!(
-            stage_and_commit(&src, &dst, &staged, Policy::Replace),
+            stage_and_commit(&src, &dst, &staged, Policy::Replace).map_err(|f| f.len()),
             Ok(Outcome::Moved)
         );
 
         assert_eq!(fs::read(dst.join("nested/f")).unwrap(), b"new");
         assert!(!dst.join("stale").exists(), "the old contents must be gone");
-        assert!(!src.exists(), "the source is consumed after the commit");
+        assert!(
+            src.join("nested/f").exists(),
+            "the caller unlinks the source, not the commit"
+        );
         assert!(!staged.exists(), "the staging path must not survive");
         assert_eq!(
             fs::read_dir(&tmp.0).unwrap().count(),
-            1,
+            2,
             "no staging leftovers in the destination directory"
+        );
+    }
+
+    /// `copy_into` stages under a private name and renames in, so the policy is
+    /// consulted against the destination again after the copy, not once.
+    #[test]
+    fn copy_into_declines_an_existing_destination_and_keeps_the_source() {
+        let tmp = Tmp::new("copy-decline");
+        let src = tmp.0.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("f"), b"new").unwrap();
+        fs::write(tmp.0.join("dst"), b"old").unwrap();
+
+        let outcome = copy_into(&src, &tmp.0, Policy::Skip).map_err(|f| f.len());
+
+        assert_eq!(outcome, Ok(Outcome::Skipped));
+        assert_eq!(fs::read(tmp.0.join("dst")).unwrap(), b"old");
+        assert!(src.join("f").exists(), "a copy never consumes its source");
+        assert_eq!(
+            fs::read_dir(&tmp.0).unwrap().count(),
+            2,
+            "no staging leftovers: {:?}",
+            fs::read_dir(&tmp.0)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The copy goes in under a private name and is renamed in, so a copy that
+    /// does not finish never has touched the destination.
+    #[test]
+    fn a_copy_that_does_not_finish_leaves_the_destination_alone() {
+        let tmp = Tmp::new("copy-partial");
+        let src = tmp.0.join("tree");
+        fs::create_dir_all(src.join("inner")).unwrap();
+        fs::write(src.join("top"), b"new").unwrap();
+        fs::write(src.join("inner/secret"), b"hidden").unwrap();
+        let dst_dir = tmp.0.join("out");
+        let dst = dst_dir.join("tree");
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("existing"), b"keep").unwrap();
+        fs::set_permissions(src.join("inner"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let failures = copy_into(&src, &dst_dir, Policy::Replace).unwrap_err();
+
+        fs::set_permissions(src.join("inner"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !failures.is_empty(),
+            "a failed copy must be reported: {failures:?}"
+        );
+        assert_eq!(
+            fs::read(dst.join("existing")).unwrap(),
+            b"keep",
+            "the destination must not be touched by a copy that failed"
+        );
+        assert!(
+            !dst.join("top").exists(),
+            "no part of the copy may land on the destination"
         );
     }
 
