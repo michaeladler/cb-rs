@@ -357,18 +357,23 @@ fn paste_moves(
     let mut skipped = 0usize;
     let mut failed = 0usize;
     for source in sources {
-        match mover::move_into(source, dst_dir, policy) {
+        let outcome = mover::move_into(source, dst_dir, policy);
+        if stays_recorded(&outcome) {
+            remaining.push(source.clone());
+        }
+        match outcome {
             Ok(mover::Outcome::Moved) => moved += 1,
-            Ok(mover::Outcome::Skipped) => {
-                skipped += 1;
-                remaining.push(source.clone());
+            Ok(mover::Outcome::MovedWithLeftover(leftover)) => {
+                eprintln!("cb: {}: {}", leftover.path.display(), leftover.reason);
+                moved += 1;
+                failed += 1;
             }
+            Ok(mover::Outcome::Skipped) => skipped += 1,
             Err(failures) => {
                 for failure in &failures {
                     eprintln!("cb: {}: {}", failure.path.display(), failure.reason);
                 }
                 failed += 1;
-                remaining.push(source.clone());
             }
         }
     }
@@ -388,6 +393,20 @@ fn paste_moves(
     }
 }
 
+/// Whether a cut entry stays recorded after one move attempt.
+///
+/// Only a move that landed consumes the entry. A skip leaves the source where it
+/// is, and a failure before the destination held the whole tree leaves a source
+/// that is still worth pasting again.
+///
+/// A move that landed but could not unlink its source is done, though: the
+/// destination has the whole tree and what is left of the source is a leftover.
+/// Pasting the entry again would copy that fragment over the destination and
+/// replace it, losing everything the fragment no longer has.
+fn stays_recorded(outcome: &Result<mover::Outcome, Vec<Failure>>) -> bool {
+    matches!(outcome, Err(_) | Ok(mover::Outcome::Skipped))
+}
+
 /// Copies do not consume the clipboard, so a second paste reads the same sources
 /// again. That is only sound because the source is read at paste time and not
 /// snapshotted at copy time.
@@ -400,7 +419,8 @@ fn paste_copies(dst_dir: &Path, policy: Policy, sources: &[PathBuf]) -> Result<(
         // above the copy and the write below it is declined or replaced whole
         // rather than merged into.
         match mover::copy_into(source, dst_dir, policy) {
-            Ok(mover::Outcome::Moved) => pasted += 1,
+            // A copy consumes nothing, so there is no source left to remove.
+            Ok(mover::Outcome::Moved) | Ok(mover::Outcome::MovedWithLeftover(_)) => pasted += 1,
             Ok(mover::Outcome::Skipped) => skipped += 1,
             Err(mut copy_failures) => failures.append(&mut copy_failures),
         }
@@ -430,5 +450,43 @@ fn report(succeeded: usize, failures: &[Failure], verb: &str) -> Result<(), Stri
         Ok(())
     } else {
         Err(format!("{} failure(s)", failures.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leftover() -> Failure {
+        Failure {
+            path: PathBuf::from("/src/kept"),
+            reason: "moved, but the source could not be removed whole".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_move_consumes_its_entry() {
+        assert!(!stays_recorded(&Ok(mover::Outcome::Moved)));
+    }
+
+    /// The source was already half removed when the unlink failed, so the next
+    /// paste copied what was left of it and replaced the complete destination
+    /// with that fragment.
+    #[test]
+    fn a_move_that_left_a_leftover_still_consumes_its_entry() {
+        assert!(
+            !stays_recorded(&Ok(mover::Outcome::MovedWithLeftover(leftover()))),
+            "the destination already holds the whole tree"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_move_stays_recorded() {
+        assert!(stays_recorded(&Ok(mover::Outcome::Skipped)));
+        let failed: Result<mover::Outcome, Vec<Failure>> = Err(vec![leftover()]);
+        assert!(
+            stays_recorded(&failed),
+            "the source is whole and can be retried"
+        );
     }
 }

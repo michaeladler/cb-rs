@@ -74,7 +74,7 @@ fn walkers() -> &'static Mutex<Vec<std::thread::ThreadId>> {
     &WALKERS
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Failure {
     pub path: PathBuf,
     pub reason: String,

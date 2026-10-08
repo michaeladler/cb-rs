@@ -14,6 +14,10 @@ use crate::walk::{Failure, Walked};
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Moved,
+    /// The destination holds the whole tree, but the source could not be removed
+    /// whole, so what is left of it is named here. The move stands: the entry is
+    /// consumed, not left to be pasted over the destination again.
+    MovedWithLeftover(Failure),
     /// Destination exists and policy said leave it alone.
     Skipped,
 }
@@ -73,20 +77,26 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
     let walked = Walked::default();
     let outcome = stage_and_commit(src, &dst, &staged, policy, Some(&walked));
     if matches!(outcome, Ok(Outcome::Moved)) {
-        remove_moved_source(src, &walked)?;
+        return remove_moved_source(src, &walked);
     }
     outcome
 }
 
-/// Unlink the source of a committed cross-device move, but only while it still
-/// holds what the copy took.
+/// Finish a committed cross-device move: unlink the source, but only while it
+/// still holds what the copy took.
 ///
 /// The copy is a walk, and a walk is not atomic: a file written into the source
 /// after the walk read that directory was never copied, and deleting the source
 /// whole would lose it. The destination is already on disk at this point, so a
-/// source that changed is reported as a failure and left for the user: the
-/// entry stays in `originals`, and the next paste copies the whole thing again.
-fn remove_moved_source(src: &Path, walked: &Walked) -> Result<(), Vec<Failure>> {
+/// source that changed is reported as a failure and left for the user: the entry
+/// stays in `originals`, and the next paste copies the whole thing again.
+///
+/// A failure to unlink is not that. The commit already happened, so the
+/// destination is complete while the source is only partly removed. Leaving the
+/// entry recorded would have the next paste copy what is left of the source and
+/// replace the tree that is already there, so the move counts and only the
+/// leftover is reported.
+fn remove_moved_source(src: &Path, walked: &Walked) -> Result<Outcome, Vec<Failure>> {
     let changed = walked.changed();
     if !changed.is_empty() {
         return Err(changed
@@ -98,7 +108,13 @@ fn remove_moved_source(src: &Path, walked: &Walked) -> Result<(), Vec<Failure>> 
             })
             .collect());
     }
-    walk::remove_any(src).map_err(|e| one(src, e))
+    match walk::remove_any(src) {
+        Ok(()) => Ok(Outcome::Moved),
+        Err(e) => Ok(Outcome::MovedWithLeftover(Failure {
+            path: src.to_path_buf(),
+            reason: format!("moved, but the source could not be removed whole: {e}"),
+        })),
+    }
 }
 
 /// Copy `src` into `dst_dir`, like [`move_into`] but leaving the source alone.
@@ -536,11 +552,49 @@ mod tests {
         let walked = committed(&src, &out);
 
         assert!(walked.changed().is_empty());
-        assert!(remove_moved_source(&src, &walked).is_ok());
+        assert_eq!(remove_moved_source(&src, &walked), Ok(Outcome::Moved));
         assert!(
             !src.exists(),
             "a completed cross-device move consumes its source"
         );
+    }
+
+    /// The source was emptied but the directory holding it stayed put, so
+    /// `remove_any` failed with the source already half gone. Reporting that as a
+    /// failed move left the entry in `originals`, and the next paste copied the
+    /// fragment that was left and replaced the whole destination with it.
+    #[test]
+    fn a_half_removed_source_is_a_moved_leftover_not_a_failed_move() {
+        let tmp = Tmp::new("leftover");
+        let src = tmp.0.join("src");
+        let out = tmp.0.join("out");
+        fs::create_dir_all(src.join("inner")).unwrap();
+        fs::write(src.join("inner/f"), b"new").unwrap();
+        fs::create_dir(&out).unwrap();
+
+        let walked = committed(&src, &out);
+        // The copy reads the source and writes to the destination, so a parent
+        // that cannot be written to still lets the commit land.
+        fs::set_permissions(&tmp.0, fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = remove_moved_source(&src, &walked);
+        fs::set_permissions(&tmp.0, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            src.exists() && !src.join("inner/f").exists(),
+            "the premise: the removal emptied the source and then failed"
+        );
+        assert_eq!(fs::read(out.join("src/inner/f")).unwrap(), b"new");
+        match outcome {
+            Ok(Outcome::MovedWithLeftover(leftover)) => {
+                assert_eq!(leftover.path, src, "the leftover source must be named");
+                assert!(
+                    leftover.reason.contains("could not be removed"),
+                    "got {}",
+                    leftover.reason
+                );
+            }
+            other => panic!("the move stands, only the cleanup failed: {other:?}"),
+        }
     }
 
     /// `copy_into` stages under a private name and renames in, so the policy is
