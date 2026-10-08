@@ -181,11 +181,16 @@ fn preserves_owner_and_access_modification_times() {
     )
     .unwrap();
     let dir = fs::File::open(&src).unwrap();
+    let future_atime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 86_400;
     rustix::fs::futimens(
         dir,
         &rustix::fs::Timestamps {
             last_access: rustix::fs::Timespec {
-                tv_sec: 1_600_000_789,
+                tv_sec: future_atime,
                 tv_nsec: 111_222_333,
             },
             last_modification: rustix::fs::Timespec {

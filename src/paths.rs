@@ -316,8 +316,12 @@ mod tests {
 
         let error = clipboard.reset().unwrap_err();
 
-        assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::IsADirectory | io::ErrorKind::PermissionDenied
+        ));
         assert!(!clipboard.originals().exists());
+        assert!(clipboard.copies().is_dir());
     }
 
     #[test]

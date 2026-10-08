@@ -34,7 +34,7 @@ fn mknodat<P: rustix::path::Arg, Fd: rustix::fd::AsFd>(
     mode: Mode,
     dev: rustix::fs::Dev,
 ) -> IoResult<()> {
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsRawFd;
 
     path.into_with_c_str(|path| {
         // SAFETY: `path` is NUL-terminated and `dirfd` stays borrowed through the call.
