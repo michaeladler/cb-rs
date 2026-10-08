@@ -115,13 +115,21 @@ impl Clipboard {
     /// An empty list removes the file, so a consumed clipboard leaves nothing
     /// behind for the next read.
     ///
-    /// Callers hold [`Self::lock`]. The write still goes to a temporary that is
-    /// renamed over the target, so a reader that ignores the lock still sees
-    /// either the whole old list or the whole new one, never half of either.
+    /// Callers hold [`Self::lock`]. The write goes to a temporary that is synced
+    /// before rename, so a reader that ignores the lock sees the whole old list or
+    /// the whole new one, never half of either.
     pub fn write_list(&self, file: &Path, paths: &[PathBuf]) -> std::io::Result<()> {
         if paths.is_empty() {
-            let _ = std::fs::remove_file(file);
-            return Ok(());
+            match std::fs::remove_file(file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+            let parent = file
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            return std::fs::File::open(parent)?.sync_all();
         }
         self.ensure()?;
         let mut bytes = Vec::new();
@@ -136,10 +144,22 @@ impl Clipboard {
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
-        output.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        output.write_all(&bytes)?;
-        drop(output);
-        std::fs::rename(&tmp, file)
+        let result = (|| {
+            output.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            output.write_all(&bytes)?;
+            output.sync_all()?;
+            drop(output);
+            std::fs::rename(&tmp, file)?;
+            let parent = file
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            std::fs::File::open(parent)?.sync_all()
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// Remove consumed paths from `file`, preserving concurrent additions.

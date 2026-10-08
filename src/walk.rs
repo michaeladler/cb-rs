@@ -15,6 +15,7 @@ use rustix::fs::{
 };
 use rustix::io::{Errno, Result as IoResult};
 use rustix::path::Arg;
+use rustix::process::Pid;
 
 #[cfg(not(target_vendor = "apple"))]
 use rustix::fs::mknodat;
@@ -96,13 +97,9 @@ struct Report {
 
 impl Report {
     fn fail(&self, path: &Path, errno: Errno) {
-        self.reject(path, &errno.to_string());
-    }
-
-    fn reject(&self, path: &Path, reason: &str) {
         self.failures.lock().unwrap().push(Failure {
             path: path.to_path_buf(),
-            reason: reason.to_owned(),
+            reason: errno.to_string(),
         });
     }
 
@@ -208,14 +205,20 @@ pub fn copy_any(src: &Path, dst: &Path) -> Vec<Failure> {
 ///
 /// A copy deletes nothing, so `walked` is `None` there and nothing is recorded.
 pub fn copy_walking(src: &Path, dst: &Path, walked: Option<&Walked>) -> Vec<Failure> {
-    let report = Arc::new(Report::default());
     if same_file(src, dst).unwrap_or(false) {
-        report.reject(src, "source and destination are the same file");
-        return report.take();
+        return vec![Failure {
+            path: src.to_path_buf(),
+            reason: "source and destination are the same file".to_owned(),
+        }];
     }
     if inside_source(src, dst).unwrap_or(false) {
-        report.reject(src, "destination is inside the source");
-        return report.take();
+        return vec![Failure {
+            path: src.to_path_buf(),
+            reason: "destination is inside the source".to_owned(),
+        }];
+    }
+    if let Some(parent) = dst.parent() {
+        clean_stale_temps_at_path(parent);
     }
     crate::progress::track(src, || copy_tree(src, dst, walked))
 }
@@ -380,21 +383,7 @@ struct DirTask {
     node: Arc<DirNode>,
 }
 
-/// Work-stealing over directories: each worker drains its own deque, then steals
-/// from peers. Thousands of small files are latency-bound, so this is where the
-/// wall clock goes.
-/// The shared queue of directories, with a count of what has been pushed and not
-/// yet finished.
-///
-/// `Injector::is_empty` on its own cannot end the walk: a worker part-way
-/// through a directory has not pushed that directory's subdirectories yet, so
-/// every other worker finds the queue empty and exits, and the rest of the tree
-/// is walked by whichever thread happened to take the root. The count says
-/// whether any thread can still produce work.
-///
-/// It cannot reach zero while another worker holds a task: a worker counts a
-/// subdirectory in before it finishes the directory it was walking, so the count
-/// never dips to zero until the last task in flight is done.
+/// Shared work-stealing queue. `live` tracks active tasks that may still produce work.
 struct Queue {
     injector: Injector<DirTask>,
     live: AtomicUsize,
@@ -423,6 +412,7 @@ impl Queue {
     }
 }
 
+/// Work-stealing keeps workers busy on wide trees.
 fn walk(root: DirTask, report: &Arc<Report>) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let queue = Queue::with_root(root);
@@ -491,6 +481,7 @@ fn process(task: &DirTask, queue: &Queue, report: &Arc<Report>) {
             return;
         }
     };
+    clean_stale_temps(&dst_fd);
     let mut dir = match Dir::read_from(&src_fd) {
         Ok(dir) => dir,
         Err(e) => {
@@ -632,12 +623,10 @@ fn handle_entry(
     }
 }
 
-/// Create `dst_name` under a private name and `renameat` it into place.
-///
-/// Unlinking first leaves a window in which a competing writer's file is gone
-/// and nothing has taken its place, so a lost race destroys the destination
-/// rather than replacing it. `renameat` replaces atomically, and the temporary
-/// is cleaned up on both failure paths.
+/// Regular files, symlinks, and device files are created under private names,
+/// then renamed into place, so a failed create or lost race never leaves the
+/// destination missing. `renameat` replaces atomically, and the temporary is
+/// cleaned up on either failure path.
 fn replace_entry<F>(dst_dir: &OwnedFd, dst_name: &CStr, create: F) -> IoResult<()>
 where
     F: FnOnce(&CStr) -> IoResult<()>,
@@ -679,8 +668,7 @@ where
 
 static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// Private enough that another `cb` will not collide: the pid, plus a counter
-/// for the many temporaries one process creates under one directory fd.
+/// Private enough that another `cb` will not collide: pid plus per-process counter.
 fn temp_name(dst_name: &CStr) -> CString {
     CString::new(temp_bytes(dst_name.to_bytes())).unwrap_or_else(|_| c".cb-tmp".to_owned())
 }
@@ -692,6 +680,62 @@ fn temp_bytes(dst_name: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn stale_temp(name: &CStr) -> bool {
+    let Some(rest) = name.to_bytes().strip_prefix(b".cb-tmp.") else {
+        return false;
+    };
+    let Some(pid_end) = rest.iter().position(|b| *b == b'.') else {
+        return false;
+    };
+    let (pid, rest) = rest.split_at(pid_end);
+    let rest = &rest[1..];
+    let Some(seq_end) = rest.iter().position(|b| *b == b'.') else {
+        return false;
+    };
+    let (seq, suffix) = rest.split_at(seq_end);
+    let suffix = &suffix[1..];
+    if pid.is_empty()
+        || seq.is_empty()
+        || suffix.is_empty()
+        || !pid.iter().all(u8::is_ascii_digit)
+        || !seq.iter().all(u8::is_ascii_digit)
+        || suffix.contains(&b'/')
+    {
+        return false;
+    }
+    let Ok(pid) = std::str::from_utf8(pid).unwrap().parse::<i32>() else {
+        return false;
+    };
+    Pid::from_raw(pid)
+        .is_some_and(|pid| rustix::process::test_kill_process(pid) == Err(Errno::SRCH))
+}
+
+// ponytail: O(entries) scan per touched dir; PID reuse can retain leftovers. Upgrade path: durable manifest.
+fn clean_stale_temps<Fd: AsFd>(dir_fd: &Fd) {
+    let Ok(dir) = Dir::read_from(dir_fd) else {
+        return;
+    };
+    let stale: Vec<_> = dir
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_owned())
+        .filter(|name| stale_temp(name))
+        .collect();
+    for name in stale {
+        let _ = remove_entry(dir_fd, &name);
+    }
+}
+
+pub(crate) fn clean_stale_temps_at_path(path: &Path) {
+    let dir = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    if let Ok(fd) = openat(CWD, dir, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()) {
+        clean_stale_temps(&fd);
+    }
+}
+
 /// A private sibling of `path`, on the same filesystem so a rename from it
 /// stays atomic. Each call names a different file.
 pub fn staged_path(path: &Path) -> IoResult<PathBuf> {
@@ -699,12 +743,7 @@ pub fn staged_path(path: &Path) -> IoResult<PathBuf> {
     Ok(path.with_file_name(OsStr::from_bytes(&temp_bytes(name.as_bytes()))))
 }
 
-/// Regular files go through a temporary name like symlinks and device files do,
-/// not into the destination itself. Writing in place truncates it up front, so a
-/// failure partway through leaves a half-written file where a working one was,
-/// every other name of a hard-linked destination changes with it, and a
-/// read-only destination cannot be opened at all.
-/// fsync everything under `path`, so a move that unlinks its source cannot lose
+/// Flush everything under `path`, so a move that unlinks its source cannot lose
 /// both to a power cut. Directories are synced after their children, so a name
 /// is only ever recorded once what it points at is.
 ///
@@ -1140,8 +1179,6 @@ mod tests {
 
     use super::*;
 
-    /// Which threads actually did work, so a test can tell a parallel walk from
-    /// one that ran on a single thread.
     struct Tmp(PathBuf);
 
     impl Tmp {
@@ -1245,6 +1282,25 @@ mod tests {
         copy_symlink(&src_dir, c"l", &dst_dir, c"l").unwrap();
 
         assert_eq!(fs::read_link(tmp.path("dst/l")).unwrap(), Path::new("new"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_temporary_entries_are_cleaned_safely() {
+        let tmp = Tmp::new("stale-temps");
+        let stale = tmp.path(&format!(".cb-tmp.{}.1.file", i32::MAX));
+        let live = tmp.path(&format!(".cb-tmp.{}.1.file", std::process::id()));
+        let unrelated = tmp.path(".cb-tmp.bad.1.file");
+        fs::write(&stale, b"stale").unwrap();
+        fs::write(&live, b"live").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+        let dir: OwnedFd = File::open(&tmp.0).unwrap().into();
+
+        clean_stale_temps(&dir);
+
+        assert!(!stale.exists());
+        assert!(live.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]

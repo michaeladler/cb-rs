@@ -334,13 +334,6 @@ fn record(
 }
 
 fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(), String> {
-    // Created once here, mkdir -p style: per-entry creation would surface as
-    // one "No such file or directory" per source, naming the source, which is
-    // where the user is not looking. Fails only when the path exists as a
-    // non-directory, which then gets reported once, naming the destination.
-    if let Err(e) = std::fs::create_dir_all(dst_dir) {
-        return Err(format!("{}: {e}", dst_dir.display()));
-    }
     // The lock covers only reading the lists. Holding it across the paste would
     // block every other `cb` command for the length of the copy; the rewrite
     // that consumes a move goes through `Clipboard::consume`, which takes the
@@ -352,6 +345,15 @@ fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(),
             clipboard.read_list(&clipboard.copies()),
         )
     };
+    if moves.is_empty() && copies.is_empty() {
+        println!("clipboard is empty");
+        return Ok(());
+    }
+    // Create destination once, mkdir -p style, so a failure is reported once
+    // against destination rather than once per source.
+    if let Err(e) = std::fs::create_dir_all(dst_dir) {
+        return Err(format!("{}: {e}", dst_dir.display()));
+    }
     let mut result = Ok(());
     if !moves.is_empty() {
         result = paste_moves(clipboard, dst_dir, policy, &moves);
@@ -397,15 +399,21 @@ fn paste_moves(
             }
         }
     }
-    match clipboard.consume(&clipboard.originals(), sources, &remaining) {
-        Ok(true) => {}
-        Ok(false) => eprintln!("cb: clipboard changed during paste, merged consumed paths"),
-        Err(e) => return Err(e.to_string()),
-    }
+    let consume_error = match clipboard.consume(&clipboard.originals(), sources, &remaining) {
+        Ok(true) => None,
+        Ok(false) => {
+            eprintln!("cb: clipboard changed during paste, merged consumed paths");
+            None
+        }
+        Err(e) => Some(e.to_string()),
+    };
     if skipped > 0 {
         println!("skipped {skipped} existing item(s)");
     }
     println!("moved {moved} item(s)");
+    if let Some(error) = consume_error {
+        return Err(error);
+    }
     if failed == 0 {
         Ok(())
     } else {
@@ -476,6 +484,22 @@ fn report(succeeded: usize, failures: &[Failure], verb: &str) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_paste_leaves_requested_destination_uncreated() {
+        let root = std::env::temp_dir().join(format!("cb-empty-paste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let dst = root.join("not-created");
+        let clipboard = Clipboard {
+            root: root.join("state"),
+        };
+
+        do_paste(&clipboard, &dst, Policy::Skip).unwrap();
+
+        assert!(!dst.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn normalise_splits_only_attached_value_options_at_char_boundaries() {

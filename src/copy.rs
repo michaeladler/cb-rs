@@ -1,6 +1,10 @@
 #[cfg(target_os = "linux")]
+use std::collections::HashSet;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+#[cfg(target_os = "linux")]
+use std::sync::{OnceLock, RwLock};
 
 #[cfg(target_os = "linux")]
 use rustix::fd::AsFd;
@@ -8,7 +12,6 @@ use rustix::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use rustix::fs::copy_file_range;
 use rustix::fs::{Mode, Stat, fchmod, fsync};
-#[cfg(target_os = "linux")]
 use rustix::io::Errno;
 use rustix::io::Result;
 #[cfg(target_os = "linux")]
@@ -29,22 +32,15 @@ const CFR_MAX: u64 = 8 << 20;
 pub static BYTES: AtomicU64 = AtomicU64::new(0);
 pub static FILES: AtomicU64 = AtomicU64::new(0);
 
-/// The `(source device, destination device)` pair a rung has refused, 0 while
-/// undecided. Asking the whole ladder costs three syscalls per file and none of
-/// them move a byte; 0 is not a device number, so it never matches a real pair.
 #[cfg(target_os = "linux")]
-static NO_REF_LINK: AtomicU64 = AtomicU64::new(0);
+static NO_REF_LINK: OnceLock<RwLock<HashSet<(u64, u64)>>> = OnceLock::new();
 #[cfg(target_os = "linux")]
-static NO_CFR: AtomicU64 = AtomicU64::new(0);
+static NO_CFR: OnceLock<RwLock<HashSet<(u64, u64)>>> = OnceLock::new();
 
-/// Both devices go into the key, not just the destination: `FICLONE` answers
-/// `EXDEV` for a pair on two mounts and `EOPNOTSUPP` for two files on one, and
-/// a `paste` of a cut recorded on two filesystems would otherwise learn "no
-/// reflink" from the first file and skip the rung for every file after it. A
-/// hash collision only costs one wasted probe.
+/// Both devices form the key: reflink support can differ by filesystem pair.
 #[cfg(target_os = "linux")]
-fn pair(src: u64, dst: u64) -> u64 {
-    src.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ dst.rotate_left(32)
+fn pair(src: u64, dst: u64) -> (u64, u64) {
+    (src, dst)
 }
 
 /// Copy a regular file's contents, trying the cheapest mechanism the
@@ -63,14 +59,17 @@ fn clone_any(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
     #[cfg(target_os = "linux")]
     {
         let key = pair(src_st.st_dev, rustix::fs::fstat(dst)?.st_dev);
+        let no_reflink = NO_REF_LINK.get_or_init(|| RwLock::new(HashSet::new()));
 
-        if NO_REF_LINK.load(Relaxed) != key {
+        if !no_reflink.read().unwrap().contains(&key) {
             match try_reflink(src, dst) {
                 Ok(()) => {
                     BYTES.fetch_add(src_st.st_size.max(0) as u64, Relaxed);
                     return Ok(Method::Reflink);
                 }
-                Err(e) if unavailable(e) => NO_REF_LINK.store(key, Relaxed),
+                Err(e) if unavailable(e) => {
+                    no_reflink.write().unwrap().insert(key);
+                }
                 // Transient: let the next rung have a go rather than give up.
                 Err(_) => {}
             }
@@ -87,8 +86,9 @@ fn clone_any(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
         // `/proc` and `/sys` report 0 and still have content, and a file that
         // grows while it is read must not be cut short at the size the stat saw.
         // So copy until the kernel says EOF, which is also where `cp` stops.
+        let no_cfr = NO_CFR.get_or_init(|| RwLock::new(HashSet::new()));
         let mut copied = false;
-        while NO_CFR.load(Relaxed) != key {
+        while !no_cfr.read().unwrap().contains(&key) {
             match copy_file_range(src, None, dst, None, CFR_MAX as usize) {
                 Ok(0) if copied => return Ok(Method::CopyFileRange),
                 Ok(0) => break,
@@ -97,7 +97,7 @@ fn clone_any(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
                     BYTES.fetch_add(n as u64, Relaxed);
                 }
                 Err(e) if unavailable(e) => {
-                    NO_CFR.store(key, Relaxed);
+                    no_cfr.write().unwrap().insert(key);
                     break;
                 }
                 Err(e) => return Err(e),
@@ -165,11 +165,17 @@ fn copy_stream(src: &OwnedFd, dst: &OwnedFd) -> Result<()> {
 }
 
 fn write_all(dst: &OwnedFd, buf: &[u8]) -> Result<()> {
-    let mut written = 0;
-    while written < buf.len() {
-        let n = rustix::io::write(dst, &buf[written..])?;
-        written += n;
+    write_all_by(buf, |remaining| rustix::io::write(dst, remaining))
+}
+
+fn write_all_by(mut buf: &[u8], mut write: impl FnMut(&[u8]) -> Result<usize>) -> Result<()> {
+    while !buf.is_empty() {
+        let n = write(buf)?;
+        if n == 0 {
+            return Err(Errno::IO);
+        }
         BYTES.fetch_add(n as u64, Relaxed);
+        buf = &buf[n..];
     }
     Ok(())
 }
@@ -333,6 +339,20 @@ mod tests {
         assert_eq!(fs::read(&dst_tmp.0).unwrap(), b"firstsecond");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsupported_capability_cache_keeps_multiple_device_pairs() {
+        let first = pair(1, 0);
+        let second = pair(0, 0x9E37_79B9_7F4A_7C15u64.rotate_right(32));
+        let cache = NO_REF_LINK.get_or_init(|| RwLock::new(HashSet::new()));
+        let mut cache = cache.write().unwrap();
+        cache.insert(first);
+        cache.insert(second);
+        assert_ne!(first, second);
+        assert!(cache.contains(&first));
+        assert!(cache.contains(&second));
+    }
+
     #[test]
     fn write_all_writes_whole_buffer() {
         let tmp = Tmp::new("write-all");
@@ -363,6 +383,11 @@ mod tests {
         write_all(&dst, &[]).unwrap();
 
         assert!(fs::read(&tmp.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_all_converts_a_zero_length_write_into_io_error() {
+        assert_eq!(write_all_by(b"x", |_| Ok(0)), Err(Errno::IO));
     }
 
     #[test]

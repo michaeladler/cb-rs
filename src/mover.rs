@@ -38,6 +38,7 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
         }]
     })?;
     let dst = dst_dir.join(name);
+    walk::clean_stale_temps_at_path(dst_dir);
 
     // Pasting into the folder the source already lives in. `renameat2` reports
     // `EXIST`, and with `--on-conflict replace` that would empty the source
@@ -131,6 +132,7 @@ pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
         }]
     })?;
     let dst = dst_dir.join(name);
+    walk::clean_stale_temps_at_path(dst_dir);
     if walk::same_file(src, &dst).unwrap_or(false) {
         return Ok(Outcome::Skipped);
     }
@@ -218,7 +220,15 @@ fn rename_noreplace(src: &Path, dst: &Path) -> IoResult<()> {
                 // the source, so the caller reads this as a missing feature.
                 return Err(Errno::OPNOTSUPP);
             }
-            linkat(CWD, src, CWD, dst, AtFlags::empty())?;
+            if let Err(e) = linkat(CWD, src, CWD, dst, AtFlags::empty()) {
+                if matches!(
+                    e,
+                    Errno::PERM | Errno::OPNOTSUPP | Errno::NOSYS | Errno::XDEV
+                ) {
+                    return Err(Errno::OPNOTSUPP);
+                }
+                return Err(e);
+            }
             // The source is now reachable under both names, so an unlink failure
             // leaves a copy rather than data loss.
             unlinkat(CWD, src, AtFlags::empty())?;
@@ -353,6 +363,21 @@ mod tests {
     #[test]
     fn sync_parent_tolerates_a_bare_name() {
         sync_parent(Path::new("f")).unwrap();
+    }
+
+    #[test]
+    fn rename_noreplace_falls_back_when_hardlinks_are_unavailable() {
+        let tmp = Tmp::new("noreplace-no-links");
+        let src = tmp.0.join("src");
+        let dst = tmp.0.join("dst");
+        fs::write(&src, b"new").unwrap();
+
+        if let Err(error) = linkat(CWD, &src, CWD, &dst, AtFlags::empty()) {
+            assert!(matches!(error, Errno::PERM | Errno::OPNOTSUPP));
+            assert_eq!(move_into(&src, &tmp.0, Policy::Replace), Ok(Outcome::Moved));
+            assert!(!src.exists());
+            assert_eq!(fs::read(dst).unwrap(), b"new");
+        }
     }
 
     #[test]
