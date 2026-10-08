@@ -26,10 +26,16 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
-    pub fn open(name: &str) -> Self {
-        Self {
-            root: state_root().join(name),
+    pub fn open(name: &str) -> io::Result<Self> {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid clipboard name",
+            ));
         }
+        Ok(Self {
+            root: state_root().join(name),
+        })
     }
 
     /// Absolute sources `paste` moves.
@@ -253,6 +259,14 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn clipboard_names_cannot_escape_state_root() {
+        for name in ["../foo", "a/b", "/abs/dir", ".", "..", ""] {
+            assert!(Clipboard::open(name).is_err(), "accepted {name:?}");
+        }
+        assert!(Clipboard::open("work").is_ok());
     }
 
     #[test]

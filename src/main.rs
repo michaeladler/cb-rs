@@ -191,7 +191,13 @@ fn main() -> ExitCode {
     };
 
     let name = cli.command.name().or(cli.name.as_ref());
-    let clipboard = Clipboard::open(name.map_or(paths::DEFAULT_NAME, String::as_str));
+    let clipboard = match Clipboard::open(name.map_or(paths::DEFAULT_NAME, String::as_str)) {
+        Ok(clipboard) => clipboard,
+        Err(error) => {
+            eprintln!("cb: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let result = match cli.command {
         Command::Copy(c) => match require_paths("copy", &c.paths) {
