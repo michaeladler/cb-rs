@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
-use cb_rs::mover::{Outcome, move_into};
+use cb_rs::mover::{Outcome, copy_into, move_into};
 use cb_rs::policy::Policy;
 use cb_rs::walk::{self, copy_any, remove_any};
 
@@ -193,6 +193,47 @@ fn a_file_moves_over_an_existing_non_empty_directory() {
         1,
         "no parking leftovers in the destination directory"
     );
+}
+
+/// Under `replace`, a directory pasted over an existing one used to merge into
+/// it, so files the source no longer has stayed behind. A move replaces the
+/// whole name, and so does a copy.
+#[test]
+fn a_replaced_directory_is_not_merged_into() {
+    let sandbox = Sandbox::new("replace-merge");
+    let src = sandbox.path("tree");
+    fs::create_dir_all(src.join("inner")).unwrap();
+    fs::write(src.join("inner/new.txt"), b"new").unwrap();
+    let dst_dir = sandbox.path("dst");
+    fs::create_dir_all(dst_dir.join("tree/inner")).unwrap();
+    fs::write(dst_dir.join("tree/stale.txt"), b"stale").unwrap();
+    fs::write(dst_dir.join("tree/inner/stale.txt"), b"stale").unwrap();
+
+    let outcome = copy_into(&src, &dst_dir, Policy::Replace).unwrap();
+
+    assert!(matches!(outcome, Outcome::Moved));
+    let dst = dst_dir.join("tree");
+    assert_eq!(fs::read(dst.join("inner/new.txt")).unwrap(), b"new");
+    assert!(
+        !dst.join("stale.txt").exists() && !dst.join("inner/stale.txt").exists(),
+        "replace must not merge: {:?}",
+        fs::read_dir(dst.join("inner")).unwrap().flatten().collect::<Vec<_>>()
+    );
+}
+
+/// A file pasted over an existing directory used to fail with `EISDIR`.
+#[test]
+fn a_file_replaces_a_directory() {
+    let sandbox = Sandbox::new("replace-dir-with-file");
+    let src = sandbox.write("file.txt", b"new");
+    let dst_dir = sandbox.path("dst");
+    fs::create_dir_all(dst_dir.join("file.txt")).unwrap();
+    fs::write(dst_dir.join("file.txt/stale.txt"), b"stale").unwrap();
+
+    let outcome = copy_into(&src, &dst_dir, Policy::Replace).unwrap();
+
+    assert!(matches!(outcome, Outcome::Moved));
+    assert_eq!(fs::read(dst_dir.join("file.txt")).unwrap(), b"new");
 }
 
 /// A read-only destination cannot be opened `O_WRONLY`, so copying over it used
