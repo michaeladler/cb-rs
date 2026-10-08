@@ -12,7 +12,7 @@ use rustix::fs::{Mode, Stat, fchmod, fsync};
 use rustix::io::Errno;
 use rustix::io::Result;
 #[cfg(target_os = "linux")]
-use rustix::ioctl::{IntegerSetter, Setter, ioctl, opcode};
+use rustix::ioctl::{IntegerSetter, ioctl, opcode};
 
 /// `_IOW(0x94, 9, int)`: clone the open file into the destination inode.
 #[cfg(target_os = "linux")]
@@ -135,28 +135,17 @@ fn unavailable(e: Errno) -> bool {
 /// be empty and the filesystem must support reflinks (btrfs, XFS, and a few
 /// others). Everything else fails and falls through.
 ///
-/// The two argument conventions disagree in the kernel. `fs/ioctl.c`'s
-/// `ioctl_ficlone` reads the source fd out of a user pointer, while btrfs's
-/// `btrfs_ioctl_ficlone` calls `fget(arg)` on the value itself. The wrong shape
-/// returns `EBADF` (btrfs) or `EFAULT` (the generic path), so the raw value is
-/// tried first and the pointer form follows only when one of those two says the
-/// kernel read the argument as an address. Every other errno is the
-/// filesystem's real answer, and re-asking in the other shape after it is one
-/// wasted syscall per file.
+/// The ioctl is issued on the destination and its argument is the source fd
+/// number, which is what `fs/ioctl.c`'s `ioctl_ficlone` reads and what btrfs's
+/// `btrfs_ioctl_ficlone` hands to `fget`. `IntegerSetter` puts that number into
+/// the `int` the `_IOW` encoding reserves room for, so one shape is right and
+/// there is nothing to retry.
 #[cfg(target_os = "linux")]
 fn try_reflink(src: &OwnedFd, dst: &OwnedFd) -> Result<()> {
-    // The ioctl is issued on the destination; the argument is the *source*
-    // file descriptor number.
     let source_fd = src.as_fd().as_raw_fd();
     // SAFETY: `source_fd` is a live descriptor owned by the caller and stays
     // open for the duration of the call.
-    match unsafe { ioctl(dst, IntegerSetter::<FICLONE>::new_usize(source_fd as usize)) } {
-        Ok(_) => return Ok(()),
-        Err(Errno::BADF | Errno::FAULT) => {}
-        Err(e) => return Err(e),
-    }
-    // SAFETY: as above; `Setter` passes a pointer to the same `int`.
-    unsafe { ioctl(dst, Setter::<FICLONE, i32>::new(source_fd)) }.map(drop)
+    unsafe { ioctl(dst, IntegerSetter::<FICLONE>::new_usize(source_fd as usize)) }.map(drop)
 }
 
 fn copy_stream(src: &OwnedFd, dst: &OwnedFd) -> Result<()> {

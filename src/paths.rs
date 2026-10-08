@@ -1,5 +1,5 @@
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -63,7 +63,14 @@ impl Clipboard {
     pub fn lock(&self) -> std::io::Result<OwnedFd> {
         self.ensure()?;
         let file = self.root.join(METADATA).join(LOCK);
-        let fd = rustix::fs::open(&file, OFlags::RDWR | OFlags::CREATE, Mode::RWXU)?;
+        // `RWUSR`, not `RWXU`: the lock file names nothing, but the lists beside
+        // it do, and a state directory another user can list is a clipboard they
+        // can read.
+        let fd = rustix::fs::open(
+            &file,
+            OFlags::RDWR | OFlags::CREATE,
+            Mode::RUSR | Mode::WUSR,
+        )?;
         flock(&fd, FlockOperation::LockExclusive)?;
         Ok(fd)
     }
@@ -128,18 +135,35 @@ impl Clipboard {
     }
 }
 
+/// `$HOME/.local/state`, or somewhere absolute when there is no `HOME`.
+///
+/// A relative fallback put the clipboard in whatever directory cb happened to run
+/// in, so the same `cut` was a different clipboard per directory, and pasting in
+/// a checkout left state in the repository.
 fn state_root() -> PathBuf {
-    if let Some(dir) = env::var_os("CLIPBOARD_PERSISTDIR") {
-        return PathBuf::from(dir);
-    }
-    if let Some(dir) = env::var_os("XDG_STATE_HOME") {
-        return PathBuf::from(dir).join(STATE_DIR);
-    }
-    home().join(".local/state").join(STATE_DIR)
+    root_from(
+        env::var_os("CLIPBOARD_PERSISTDIR"),
+        env::var_os("XDG_STATE_HOME"),
+        env::var_os("HOME"),
+    )
 }
 
-fn home() -> PathBuf {
-    env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
+fn root_from(persist: Option<OsString>, xdg: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    if let Some(dir) = persist {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = xdg {
+        return PathBuf::from(dir).join(STATE_DIR);
+    }
+    match home {
+        Some(home) => PathBuf::from(home).join(".local/state").join(STATE_DIR),
+        // One directory per user, so two of them cannot share a clipboard. The
+        // uid is the only identity a process without `HOME` still has.
+        None => PathBuf::from("/tmp").join(format!(
+            "{STATE_DIR}-{}",
+            rustix::process::getuid().as_raw()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +215,62 @@ mod tests {
         drop(held);
         rx.recv_timeout(Duration::from_secs(10))
             .expect("the lock must be released when it is dropped");
+    }
+
+    #[test]
+    fn the_lock_file_is_not_readable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = Tmp::new("lock-mode");
+        let clipboard = tmp.clipboard();
+        drop(clipboard.lock().unwrap());
+
+        let mode = std::fs::metadata(clipboard.root.join("metadata").join("lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the lists beside the lock name the user's files"
+        );
+    }
+
+    /// The state root must be absolute whatever the environment says, or the
+    /// same `cut` is a different clipboard per working directory and a paste in a
+    /// checkout leaves state in the repository.
+    #[test]
+    fn the_state_root_is_always_absolute() {
+        let none: Option<OsString> = None;
+        for (persist, xdg, home) in [
+            (Some(OsString::from("/persist")), none.clone(), none.clone()),
+            (
+                none.clone(),
+                Some(OsString::from("/xdg")),
+                Some(OsString::from("/home/someone")),
+            ),
+            (
+                none.clone(),
+                none.clone(),
+                Some(OsString::from("/home/someone")),
+            ),
+            (none.clone(), none.clone(), none),
+        ] {
+            let root = root_from(persist.clone(), xdg.clone(), home.clone());
+            assert!(
+                root.is_absolute(),
+                "{root:?} from {persist:?}/{xdg:?}/{home:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_home_falls_back_to_a_per_user_directory() {
+        let root = root_from(None, None, None);
+        assert!(
+            root.starts_with("/tmp") && root.file_name().unwrap() != STATE_DIR,
+            "a HOME-less process must not share one clipboard with the next user: {root:?}"
+        );
     }
 
     #[test]
