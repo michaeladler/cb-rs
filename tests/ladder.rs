@@ -390,9 +390,9 @@ fn move_uses_rename_and_leaves_no_source() {
 /// `renameat2` answers `EXDEV` for two mounts, and only `EXDEV` takes the mover
 /// down its copy-then-delete branch, so this cannot be faked with a second
 /// directory on the same filesystem. `scripts/testvol.sh` provides one.
-fn other_device_dir() -> Option<PathBuf> {
+fn other_device_dir(name: &str) -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("CB_TESTVOL_DIR")?)
-        .join(format!("cb-xdev-{}", std::process::id()));
+        .join(format!("cb-xdev-{}-{name}", std::process::id()));
     fs::create_dir_all(&dir).ok()?;
     let temp_dev = fs::metadata(std::env::temp_dir()).ok()?.dev();
     (fs::metadata(&dir).ok()?.dev() != temp_dev).then_some(dir)
@@ -403,7 +403,7 @@ fn other_device_dir() -> Option<PathBuf> {
 /// `fsync` and the recursive delete all take the cross-device path too.
 #[test]
 fn a_move_across_devices_copies_verifies_then_deletes() {
-    let Some(xdev) = other_device_dir() else {
+    let Some(xdev) = other_device_dir("move") else {
         eprintln!("skipping: no second filesystem (set CB_TESTVOL_DIR)");
         return;
     };
@@ -436,7 +436,7 @@ fn a_move_across_devices_copies_verifies_then_deletes() {
 /// only on the same-filesystem path.
 #[test]
 fn a_move_across_devices_skips_an_existing_destination() {
-    let Some(xdev) = other_device_dir() else {
+    let Some(xdev) = other_device_dir("policy") else {
         eprintln!("skipping: no second filesystem (set CB_TESTVOL_DIR)");
         return;
     };
