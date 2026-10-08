@@ -290,7 +290,7 @@ fn record(
     };
     // "more" only when there was something to add to.
     let added_to_existing = amend && !list.is_empty();
-    let recorded = list.len() + sources.len();
+    let recorded = sources.len();
     list.append(&mut sources);
     clipboard
         .write_list(&file, &list)

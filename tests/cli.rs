@@ -290,7 +290,7 @@ fn amend_reports_more_only_when_the_clipboard_had_entries() {
     let second = sandbox.ok(&["copy", "--amend", "moved.txt"]);
     assert_eq!(
         String::from_utf8_lossy(&second.stdout).trim(),
-        "copy 2 more item(s), will copy on paste"
+        "copy 1 more item(s), will copy on paste"
     );
 }
 
