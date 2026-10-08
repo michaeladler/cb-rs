@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use crossbeam_deque::{Injector, Steal, Worker};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
-    AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat, fchmod, mkdirat, openat, readlinkat, renameat,
-    statat, symlinkat, unlinkat,
+    AtFlags, CWD, Dir, FileType, Gid, Mode, OFlags, Stat, Timespec, Timestamps, Uid, chownat,
+    fchmod, fchown, mkdirat, openat, readlinkat, renameat, statat, symlinkat, unlinkat, utimensat,
 };
 use rustix::io::{Errno, Result as IoResult};
 use rustix::path::Arg;
@@ -269,12 +269,7 @@ fn copy_tree(src: &Path, dst: &Path, walked: Option<&Walked>) -> Vec<Failure> {
             // subtree is in place. A read-only or execute-only source
             // directory must still be writable while its children are being
             // created, so the chmod cannot happen here.
-            let node = DirNode::new(
-                Mode::from_raw_mode(st.st_mode),
-                dst.to_path_buf(),
-                None,
-                &report,
-            );
+            let node = DirNode::new(st, dst.to_path_buf(), None, &report);
             walk(
                 DirTask {
                     src: src.to_path_buf(),
@@ -304,25 +299,19 @@ fn copy_tree(src: &Path, dst: &Path, walked: Option<&Walked>) -> Vec<Failure> {
 
 /// Completion bookkeeping for one destination directory.
 ///
-/// A directory is created writable (`RWXU`) and later restricted to the
-/// source's mode, because a read-only or execute-only source directory must
-/// still be writable while its children are being created. The restriction
-/// therefore cannot happen when the directory is created, nor when the worker
-/// that owns it has merely finished iterating: the subdirectory tasks it
-/// pushed during that iteration have not run yet.
+/// A directory is created writable (`RWXU`) and later restored to the source's
+/// metadata, because a read-only or execute-only source directory must still be
+/// writable while its children are being created. Restoration cannot happen
+/// until all subdirectory tasks finish.
 ///
-/// Each node counts the work outstanding beneath it — its own entry list, plus
-/// one per subdirectory — and applies its mode when the count reaches zero.
+/// Each node counts outstanding work beneath it and restores metadata when the
+/// count reaches zero.
 ///
 /// The node keeps only the path, never an fd: holding one open descriptor per
-/// queued task pins descriptors for the whole subtree's lifetime and exhausts
-/// the process limit on a wide tree (a directory with 2,000 subdirectories
-/// would hold 2,000 fds before any of them is processed). The finalizer
-/// instead opens the destination just before the `fchmod` and closes it right
-/// after, and the open is `NOFOLLOW`-guarded, so a directory swapped for a
-/// symlink before finalization is reported rather than chmod-followed.
+/// queued task exhausts the process limit on a wide tree. The finalizer opens
+/// the destination just before restoring metadata, with `NOFOLLOW`.
 struct DirNode {
-    mode: Mode,
+    st: Stat,
     dst: PathBuf,
     pending: AtomicUsize,
     parent: Option<Arc<DirNode>>,
@@ -331,7 +320,7 @@ struct DirNode {
 
 impl DirNode {
     fn new(
-        mode: Mode,
+        st: Stat,
         dst: PathBuf,
         parent: Option<Arc<DirNode>>,
         report: &Arc<Report>,
@@ -343,7 +332,7 @@ impl DirNode {
             p.pending.fetch_add(1, Release);
         }
         Arc::new(Self {
-            mode,
+            st,
             dst,
             pending: AtomicUsize::new(1),
             parent,
@@ -367,7 +356,8 @@ impl DirNode {
                 Mode::empty(),
             ) {
                 Ok(fd) => {
-                    if let Err(e) = fchmod(&fd, self.mode) {
+                    let result = preserve_metadata(&fd, CWD, &self.dst, &self.st);
+                    if let Err(e) = result {
                         self.report.fail(&self.dst, e);
                     }
                 }
@@ -597,8 +587,8 @@ fn handle_entry(
             report.fail(&src_path, e);
             return;
         }
-        let mode = match statat(src_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) => Mode::from_raw_mode(st.st_mode),
+        let st = match statat(src_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
             Err(e) => {
                 report.fail(&src_path, e);
                 return;
@@ -607,7 +597,7 @@ fn handle_entry(
         // No fd here: the node is just a path and a counter, so a wide
         // directory queues many tasks without touching the fd limit. The
         // destination fd opens only when a worker processes the task.
-        let node = DirNode::new(mode, dst_path, Some(Arc::clone(&task.node)), report);
+        let node = DirNode::new(st, dst_path, Some(Arc::clone(&task.node)), report);
         queue.push(DirTask {
             src: src_path,
             node,
@@ -626,7 +616,8 @@ fn handle_entry(
                     other,
                     Mode::from_raw_mode(st.st_mode),
                     st.st_rdev,
-                )
+                )?;
+                preserve_metadata_at(dst_fd, tmp, &st)
             }),
             Err(e) => Err(e),
         },
@@ -805,6 +796,51 @@ fn open_regular<P: rustix::path::Arg>(dir: impl AsFd, path: P) -> IoResult<Owned
     Ok(fd)
 }
 
+fn timestamps(st: &Stat) -> Timestamps {
+    Timestamps {
+        last_access: Timespec {
+            tv_sec: st.st_atime,
+            tv_nsec: st.st_atime_nsec as _,
+        },
+        last_modification: Timespec {
+            tv_sec: st.st_mtime,
+            tv_nsec: st.st_mtime_nsec as _,
+        },
+    }
+}
+
+fn preserve_metadata<Fd: AsFd, Dir: AsFd, P: Arg>(
+    fd: Fd,
+    dir: Dir,
+    path: P,
+    st: &Stat,
+) -> IoResult<()> {
+    if rustix::process::geteuid().is_root() {
+        fchown(
+            &fd,
+            Some(Uid::from_raw(st.st_uid)),
+            Some(Gid::from_raw(st.st_gid)),
+        )?;
+    }
+    fchmod(&fd, Mode::from_raw_mode(st.st_mode))?;
+    utimensat(dir, path, &timestamps(st), AtFlags::SYMLINK_NOFOLLOW)
+}
+
+fn preserve_metadata_at<Fd: AsFd, P: Arg>(dir: Fd, path: P, st: &Stat) -> IoResult<()> {
+    path.into_with_c_str(|path| {
+        if rustix::process::geteuid().is_root() {
+            chownat(
+                &dir,
+                path,
+                Some(Uid::from_raw(st.st_uid)),
+                Some(Gid::from_raw(st.st_gid)),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+        }
+        utimensat(dir, path, &timestamps(st), AtFlags::SYMLINK_NOFOLLOW)
+    })
+}
+
 fn copy_regular(
     src_dir: &OwnedFd,
     src_name: &CStr,
@@ -821,7 +857,7 @@ fn copy_regular(
             Mode::RUSR | Mode::WUSR,
         )?;
         copy::clone_file(&src_fd, &dst_fd, &st)?;
-        copy::preserve_mode(&dst_fd, Mode::from_raw_mode(st.st_mode))
+        preserve_metadata(&dst_fd, dst_dir, tmp, &st)
     })
 }
 
@@ -834,8 +870,10 @@ fn copy_symlink(
     dst_name: &CStr,
 ) -> IoResult<()> {
     let target = readlinkat(src_dir, src_name, Vec::new())?;
+    let st = statat(src_dir, src_name, AtFlags::SYMLINK_NOFOLLOW)?;
     replace_entry(dst_dir, dst_name, |tmp| {
-        symlinkat(target.as_bytes(), dst_dir, tmp)
+        symlinkat(target.as_bytes(), dst_dir, tmp)?;
+        preserve_metadata_at(dst_dir, tmp, &st)
     })
 }
 
@@ -843,7 +881,11 @@ fn copy_symlink(
 /// directory fd, which is what the recursive worker passes around.
 fn copy_symlink_path(src: &Path, dst: &Path) -> IoResult<()> {
     let target = rustix::fs::readlink(src, Vec::new())?;
-    replace_entry_path(dst, |tmp| rustix::fs::symlink(target.as_bytes(), tmp))
+    let st = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW)?;
+    replace_entry_path(dst, |tmp| {
+        rustix::fs::symlink(target.as_bytes(), tmp)?;
+        preserve_metadata_at(CWD, tmp, &st)
+    })
 }
 
 fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
@@ -856,7 +898,7 @@ fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
             Mode::RUSR | Mode::WUSR,
         )?;
         copy::clone_file(&src_fd, &dst_fd, &st)?;
-        copy::preserve_mode(&dst_fd, Mode::from_raw_mode(st.st_mode))
+        preserve_metadata(&dst_fd, CWD, tmp, &st)
     })
 }
 
@@ -869,7 +911,8 @@ fn copy_other_path(src: &Path, dst: &Path, file_type: FileType) -> IoResult<()> 
             file_type,
             Mode::from_raw_mode(st.st_mode),
             st.st_rdev,
-        )
+        )?;
+        preserve_metadata_at(CWD, tmp, &st)
     })
 }
 
@@ -1360,10 +1403,12 @@ mod tests {
     #[test]
     fn the_queue_is_only_drained_once_the_last_task_is_finished() {
         let report = Arc::new(Report::default());
-        let src = Tmp::new("queue").0.join("src");
+        let tmp = Tmp::new("queue");
+        let src = tmp.0.join("src");
+        let st = statat(CWD, &tmp.0, AtFlags::SYMLINK_NOFOLLOW).unwrap();
         let queue = Queue::with_root(DirTask {
             src,
-            node: DirNode::new(Mode::RWXU, PathBuf::from("/nowhere"), None, &report),
+            node: DirNode::new(st, PathBuf::from("/nowhere"), None, &report),
         });
         let deque = Worker::new_lifo();
 

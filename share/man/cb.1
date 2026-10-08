@@ -55,6 +55,8 @@ Files or directories to move on paste
 .SS cb paste
 Write the clipboard\*(Aqs files into the current directory
 
+Copies and cross-filesystem moves preserve permission bits and access/modification times. Owner and group are preserved when run as root. Copies do not preserve xattrs, ACLs, sparse holes, or hardlink relationships; each hardlink is copied as a separate file.
+
 .TP
 \fB\-d\fR, \fB\-\-directory\fR \fI<DIRECTORY>\fR
 Destination directory, defaults to the current one

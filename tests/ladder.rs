@@ -159,6 +159,74 @@ fn preserves_permission_bits() {
 }
 
 #[test]
+fn preserves_owner_and_access_modification_times() {
+    let sandbox = Sandbox::new("metadata");
+    let src = sandbox.path("source");
+    fs::create_dir(&src).unwrap();
+    let file_path = src.join("file");
+    fs::write(&file_path, b"contents").unwrap();
+    let file = fs::File::open(&file_path).unwrap();
+    rustix::fs::futimens(
+        file,
+        &rustix::fs::Timestamps {
+            last_access: rustix::fs::Timespec {
+                tv_sec: 1_600_000_123,
+                tv_nsec: 123_456_789,
+            },
+            last_modification: rustix::fs::Timespec {
+                tv_sec: 1_600_000_456,
+                tv_nsec: 987_654_321,
+            },
+        },
+    )
+    .unwrap();
+    let dir = fs::File::open(&src).unwrap();
+    rustix::fs::futimens(
+        dir,
+        &rustix::fs::Timestamps {
+            last_access: rustix::fs::Timespec {
+                tv_sec: 1_600_000_789,
+                tv_nsec: 111_222_333,
+            },
+            last_modification: rustix::fs::Timespec {
+                tv_sec: 1_600_000_987,
+                tv_nsec: 444_555_666,
+            },
+        },
+    )
+    .unwrap();
+    let expected_file = fs::metadata(&file_path).unwrap();
+    let expected_dir = fs::metadata(&src).unwrap();
+    let dst = sandbox.path("copy");
+
+    let failures = copy_any(&src, &dst);
+    assert!(failures.is_empty(), "{failures:?}");
+
+    let copied_file = fs::metadata(dst.join("file")).unwrap();
+    assert_eq!(
+        (copied_file.atime(), copied_file.atime_nsec()),
+        (expected_file.atime(), expected_file.atime_nsec())
+    );
+    assert_eq!(
+        (copied_file.mtime(), copied_file.mtime_nsec()),
+        (expected_file.mtime(), expected_file.mtime_nsec())
+    );
+    assert_eq!(
+        (copied_file.uid(), copied_file.gid()),
+        (expected_file.uid(), expected_file.gid())
+    );
+    let copied_dir = fs::metadata(dst).unwrap();
+    assert_eq!(
+        (copied_dir.atime(), copied_dir.atime_nsec()),
+        (expected_dir.atime(), expected_dir.atime_nsec())
+    );
+    assert_eq!(
+        (copied_dir.mtime(), copied_dir.mtime_nsec()),
+        (expected_dir.mtime(), expected_dir.mtime_nsec())
+    );
+}
+
+#[test]
 fn destination_is_never_an_alias_of_the_original() {
     let sandbox = Sandbox::new("inode");
     let src = sandbox.write("src.bin", &vec![7u8; 512 * 1024]);

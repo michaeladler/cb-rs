@@ -85,7 +85,7 @@ Read these before pointing `cb-rs` at anything you care about.
 - Paste of copied paths does not empty the clipboard. The sources stay recorded, so a second paste copies them again. Only `cut` consumes.
 - `ask` needs a terminal. With stdin not a tty it answers no, so it behaves like `skip`.
 - A cross-filesystem move is verified by "no syscall failed, then fsync", not by comparing content. The original copied into its clipboard, copied back out, and deleted the originals with nothing checked at any step, but this is still not a checksum.
-- Only permission bits are preserved. Hardlinks, ownership, timestamps, xattrs, ACLs, and sparse holes are not.
+- Permission bits and access/modification times are preserved on copies and cross-filesystem moves. When run as root, `cb-rs` also preserves owner and group. Same-filesystem moves use rename and keep filesystem metadata; copies do not preserve xattrs, ACLs, sparse holes, or hardlink relationships (each link becomes its own file).
 - Symlinks are recreated, never followed. A tree whose links point outside itself pastes links that may dangle until the destination has them too.
 - Failures are per entry and do not abort the run. The count is printed and the exit status is 1, but the remaining items still move.
 - macOS lacks `mknodat`; fifo and device-node creation uses path-based `mknod` and can fail where OS permissions deny it. Only the streaming rung of the copy ladder is compiled in, so big-file copies there are at `cb` parity, not better.
