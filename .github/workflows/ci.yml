@@ -47,6 +47,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+      - name: install coverage tools
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --locked
 
       - name: install filesystem tools
         if: matrix.fs != 'plain'
@@ -66,12 +70,12 @@ jobs:
         if: matrix.fs != 'plain'
         run: scripts/testvol.sh ${{ matrix.fs }} "$RUNNER_TEMP/volume"
 
-      - name: cargo test
+      - name: cargo test with coverage
         env:
           CB_TESTVOL_DIR: ${{ runner.temp }}/volume
         run: |
           set -o pipefail
-          cargo test --all-features -- --nocapture 2>&1 | tee ci-test.log
+          cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info -- --nocapture 2>&1 | tee ci-test.log
 
       # A skipped reflink test is a green check that tested nothing, which is
       # exactly what an unwritable or reflink-less volume looks like.
@@ -84,6 +88,14 @@ jobs:
             grep -E '^skipping' ci-test.log
             exit 1
           fi
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: lcov.info
+          flags: ${{ matrix.os }}-${{ matrix.fs }}
 
   # The bench page is parsed out of bench.log, not hand-written, so bench.py's
   # row format and the parser can drift apart and only the published page shows
