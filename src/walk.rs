@@ -364,7 +364,7 @@ impl DirNode {
                 Mode::empty(),
             ) {
                 Ok(fd) => {
-                    let result = preserve_metadata(&fd, CWD, &self.dst, &self.st);
+                    let result = preserve_metadata(&fd, &self.st);
                     if let Err(e) = result {
                         self.report.fail(&self.dst, e);
                     }
@@ -970,12 +970,7 @@ fn timestamps(st: &Stat) -> Timestamps {
     }
 }
 
-fn preserve_metadata<Fd: AsFd, Dir: AsFd, P: Arg>(
-    fd: Fd,
-    dir: Dir,
-    path: P,
-    st: &Stat,
-) -> IoResult<()> {
+fn preserve_metadata<Fd: AsFd>(fd: Fd, st: &Stat) -> IoResult<()> {
     if rustix::process::geteuid().is_root() {
         fchown(
             &fd,
@@ -984,7 +979,7 @@ fn preserve_metadata<Fd: AsFd, Dir: AsFd, P: Arg>(
         )?;
     }
     fchmod(&fd, Mode::from_raw_mode(st.st_mode))?;
-    utimensat(dir, path, &timestamps(st), AtFlags::SYMLINK_NOFOLLOW)
+    rustix::fs::futimens(&fd, &timestamps(st))
 }
 
 fn preserve_metadata_at<Fd: AsFd, P: Arg>(dir: Fd, path: P, st: &Stat) -> IoResult<()> {
@@ -1018,7 +1013,7 @@ fn copy_regular(
             Mode::RUSR | Mode::WUSR,
         )?;
         copy::clone_file(&src_fd, &dst_fd, &st)?;
-        preserve_metadata(&dst_fd, dst_dir, tmp, &st)
+        preserve_metadata(&dst_fd, &st)
     })
 }
 
@@ -1059,7 +1054,7 @@ fn copy_regular_path(src: &Path, dst: &Path) -> IoResult<()> {
             Mode::RUSR | Mode::WUSR,
         )?;
         copy::clone_file(&src_fd, &dst_fd, &st)?;
-        preserve_metadata(&dst_fd, CWD, tmp, &st)
+        preserve_metadata(&dst_fd, &st)
     })
 }
 
