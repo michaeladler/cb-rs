@@ -10,6 +10,8 @@ use crate::policy::Policy;
 use crate::walk;
 use crate::walk::{Failure, Walked};
 
+type DestinationIdentity = (u128, u128);
+
 /// What became of one move attempt.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -75,7 +77,7 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
     // runs is only ever replaced by a finished tree.
     let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
     let walked = Walked::default();
-    let outcome = stage_and_commit(src, &dst, &staged, policy, Some(&walked));
+    let outcome = stage_and_commit(src, &dst, &staged, policy, Some(&walked), None);
     if matches!(outcome, Ok(Outcome::Moved)) {
         return remove_moved_source(src, &walked);
     }
@@ -119,10 +121,8 @@ fn remove_moved_source(src: &Path, walked: &Walked) -> Result<Outcome, Vec<Failu
 
 /// Copy `src` into `dst_dir`, like [`move_into`] but leaving the source alone.
 ///
-/// Staged and renamed in like a move, so the policy is consulted against the
-/// destination twice: once before the copy and once after it. A destination that
-/// appears while the copy runs is then either declined or replaced whole, never
-/// merged into.
+/// Staged and renamed in like a move. An existing destination is approved before
+/// the copy, then re-approved only if its inode changes before commit.
 pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, Vec<Failure>> {
     let name = src.file_name().ok_or_else(|| {
         vec![Failure {
@@ -140,12 +140,13 @@ pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
             reason: "destination is inside the source".to_owned(),
         }]);
     }
-    if exists(&dst).map_err(|e| one(src, e))? && !policy.resolve(&dst).map_err(|e| one(src, e))? {
+    let approved_dst = destination_identity(&dst).map_err(|e| one(src, e))?;
+    if approved_dst.is_some() && !policy.resolve(&dst).map_err(|e| one(src, e))? {
         return Ok(Outcome::Skipped);
     }
     let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
     // A copy consumes nothing, so there is no source to check and nothing to record.
-    stage_and_commit(src, &dst, &staged, policy, None)
+    stage_and_commit(src, &dst, &staged, policy, None, approved_dst)
 }
 
 /// Copy `src` to `staged`, then rename it onto `dst`. A staged tree that did not
@@ -157,8 +158,9 @@ fn stage_and_commit(
     staged: &Path,
     policy: Policy,
     walked: Option<&Walked>,
+    approved_dst: Option<DestinationIdentity>,
 ) -> Result<Outcome, Vec<Failure>> {
-    let result = copy_then_commit(src, dst, staged, policy, walked);
+    let result = copy_then_commit(src, dst, staged, policy, walked, approved_dst);
     if !matches!(result, Ok(Outcome::Moved)) {
         let _ = walk::remove_any(staged);
     }
@@ -171,14 +173,18 @@ fn copy_then_commit(
     staged: &Path,
     policy: Policy,
     walked: Option<&Walked>,
+    approved_dst: Option<DestinationIdentity>,
 ) -> Result<Outcome, Vec<Failure>> {
     let failures = walk::copy_walking(src, staged, walked);
     if !failures.is_empty() {
         return Err(failures);
     }
-    // Re-read rather than trusting the answer from above the copy: the staged
-    // tree went in under a private name, so only now does it overwrite.
-    if exists(dst).map_err(|e| one(src, e))? && !policy.resolve(dst).map_err(|e| one(src, e))? {
+    // Re-check after staging: approve newly appeared or replaced destinations.
+    let current_dst = destination_identity(dst).map_err(|e| one(src, e))?;
+    if current_dst != approved_dst
+        && current_dst.is_some()
+        && !policy.resolve(dst).map_err(|e| one(src, e))?
+    {
         return Ok(Outcome::Skipped);
     }
     replace_by_rename(staged, dst).map_err(|e| one(src, e))?;
@@ -225,9 +231,13 @@ fn rename_noreplace(src: &Path, dst: &Path) -> IoResult<()> {
 /// Whether `path` is taken, without following a final symlink. `Path::exists`
 /// follows it, so a dangling link reads as free and gets overwritten.
 pub fn exists(path: &Path) -> IoResult<bool> {
+    Ok(destination_identity(path)?.is_some())
+}
+
+fn destination_identity(path: &Path) -> IoResult<Option<DestinationIdentity>> {
     match statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => Ok(true),
-        Err(Errno::NOENT) => Ok(false),
+        Ok(stat) => Ok(Some((stat.st_dev as u128, stat.st_ino as u128))),
+        Err(Errno::NOENT) => Ok(None),
         Err(e) => Err(e),
     }
 }
@@ -452,7 +462,7 @@ mod tests {
         fs::write(&dst, b"old").unwrap();
 
         assert_eq!(
-            stage_and_commit(&src, &dst, &staged, Policy::Skip, None).map_err(|f| f.len()),
+            stage_and_commit(&src, &dst, &staged, Policy::Skip, None, None).map_err(|f| f.len()),
             Ok(Outcome::Skipped)
         );
 
@@ -481,7 +491,7 @@ mod tests {
         fs::write(dst.join("stale"), b"old").unwrap();
 
         assert_eq!(
-            stage_and_commit(&src, &dst, &staged, Policy::Replace, None).map_err(|f| f.len()),
+            stage_and_commit(&src, &dst, &staged, Policy::Replace, None, None).map_err(|f| f.len()),
             Ok(Outcome::Moved)
         );
 
@@ -506,7 +516,7 @@ mod tests {
         let staged = walk::staged_path(&dst).unwrap();
         let walked = Walked::default();
         assert_eq!(
-            stage_and_commit(src, &dst, &staged, Policy::Replace, Some(&walked))
+            stage_and_commit(src, &dst, &staged, Policy::Replace, Some(&walked), None)
                 .map_err(|f| f.len()),
             Ok(Outcome::Moved)
         );
@@ -597,11 +607,9 @@ mod tests {
         }
     }
 
-    /// `copy_into` stages under a private name and renames in, so the policy is
-    /// consulted against the destination again after the copy, not once.
-    /// The commit path flushed the destination by opening it `O_RDONLY`, which
-    /// follows a symlink: a dangling one answered `ENOENT` after the rename had
-    /// already landed, so the move failed and left the source behind as well.
+    /// A dangling destination symlink counts as occupied during commit. The
+    /// commit path used to flush it by opening `O_RDONLY`, which followed the
+    /// link: `ENOENT` after rename left the source behind despite the commit.
     #[test]
     fn a_dangling_symlink_reaches_the_destination() {
         let tmp = Tmp::new("sym-commit");
@@ -613,10 +621,45 @@ mod tests {
         std::os::unix::fs::symlink("nowhere", &src).unwrap();
 
         let outcome =
-            copy_then_commit(&src, &dst, &staged, Policy::Skip, None).map_err(|f| f.len());
+            copy_then_commit(&src, &dst, &staged, Policy::Skip, None, None).map_err(|f| f.len());
 
         assert_eq!(outcome, Ok(Outcome::Moved));
         assert_eq!(fs::read_link(&dst).unwrap(), Path::new("nowhere"));
+    }
+
+    #[test]
+    fn copy_commit_reuses_approval_for_the_same_destination_inode() {
+        let tmp = Tmp::new("copy-approved");
+        let src = tmp.0.join("src");
+        let dst = tmp.0.join("dst");
+        let staged = walk::staged_path(&dst).unwrap();
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+        let approved_dst = destination_identity(&dst).unwrap();
+
+        let result = stage_and_commit(&src, &dst, &staged, Policy::Skip, None, approved_dst);
+
+        assert_eq!(result, Ok(Outcome::Moved));
+        assert_eq!(fs::read(&dst).unwrap(), b"new");
+    }
+
+    #[test]
+    fn copy_commit_rechecks_approval_after_destination_inode_changes() {
+        let tmp = Tmp::new("copy-changed-dst");
+        let src = tmp.0.join("src");
+        let dst = tmp.0.join("dst");
+        let staged = walk::staged_path(&dst).unwrap();
+        fs::write(&src, b"new").unwrap();
+        fs::write(&dst, b"old").unwrap();
+        let approved_dst = destination_identity(&dst).unwrap();
+        let replacement = tmp.0.join("replacement");
+        fs::write(&replacement, b"changed").unwrap();
+        fs::rename(replacement, &dst).unwrap();
+
+        let result = stage_and_commit(&src, &dst, &staged, Policy::Skip, None, approved_dst);
+
+        assert_eq!(result, Ok(Outcome::Skipped));
+        assert_eq!(fs::read(&dst).unwrap(), b"changed");
     }
 
     #[test]

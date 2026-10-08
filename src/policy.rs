@@ -17,9 +17,8 @@ pub enum Policy {
 impl Policy {
     /// Decide whether the copy may proceed. The answer is about what the
     /// destination looked like when this was called, not about what it looks
-    /// like when the write lands: the copy is staged under a private name and
-    /// renamed in, so a destination that appears in between is met by the same
-    /// question again rather than by a merge.
+    /// like when the write lands: a destination that appears or changes while
+    /// the copy is staged needs its own approval before replacement.
     pub fn resolve(self, dst: &Path) -> IoResult<bool> {
         Ok(match self {
             Self::Skip => false,
