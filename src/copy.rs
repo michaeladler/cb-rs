@@ -76,18 +76,25 @@ fn clone_any(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
             }
         }
 
-        // `copy_file_range` is one syscall per 1 MiB instead of per 4 KiB, and on
+        // `copy_file_range` is one syscall per 8 MiB instead of per 4 KiB, and on
         // kernels that support it across mounts stays entirely in the kernel.
         //
         // rustix only ships it on Linux and `std::fs::copy_file_range` is still
         // unstable, so elsewhere the rung is skipped and `copy_stream` pays. macOS
         // has its own `clonefile`; add it as a rung before anyone needs the speed.
-        let mut remaining = src_st.st_size.max(0) as u64;
-        while remaining > 0 && NO_CFR.load(Relaxed) != key {
-            match copy_file_range(src, None, dst, None, remaining.min(CFR_MAX) as usize) {
-                Ok(0) => break,
+        //
+        // `st_size` is a hint for the progress display, never the stopping point:
+        // `/proc` and `/sys` report 0 and still have content, and a file that
+        // grows while it is read must not be cut short at the size the stat saw.
+        // So copy until the kernel says EOF, which is also where `cp` stops.
+        let mut eof = false;
+        while NO_CFR.load(Relaxed) != key {
+            match copy_file_range(src, None, dst, None, CFR_MAX as usize) {
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
                 Ok(n) => {
-                    remaining -= n as u64;
                     BYTES.fetch_add(n as u64, Relaxed);
                 }
                 Err(e) if unavailable(e) => {
@@ -97,7 +104,7 @@ fn clone_any(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
                 Err(e) => return Err(e),
             }
         }
-        if remaining == 0 {
+        if eof {
             return Ok(Method::CopyFileRange);
         }
     }
@@ -204,6 +211,7 @@ pub enum Method {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File, OpenOptions};
+    use std::io::Write;
     use std::path::PathBuf;
 
     use super::*;
@@ -304,6 +312,26 @@ mod tests {
         // Other tests share the counters, so only a lower bound holds.
         assert!(BYTES.load(Relaxed) - bytes0 >= data.len() as u64);
         assert!(FILES.load(Relaxed) - files0 >= 1);
+    }
+
+    /// A file that grows during the copy used to be cut short at the size the
+    /// stat saw.
+    #[test]
+    fn a_file_that_grows_during_the_copy_is_copied_whole() {
+        let (src_tmp, dst_tmp) = (Tmp::new("grow-src"), Tmp::new("grow-dst"));
+        fs::write(&src_tmp.0, b"first").unwrap();
+        let src: OwnedFd = File::open(&src_tmp.0).unwrap().into();
+        let dst = dst_tmp.open();
+        // Stat before the append, so `st_size` is one half of what is there by
+        // the time the copy runs.
+        let st = rustix::fs::fstat(&src).unwrap();
+        let mut src_file = File::options().append(true).open(&src_tmp.0).unwrap();
+        src_file.write_all(b"second").unwrap();
+        src_file.flush().unwrap();
+
+        clone_file(&src, &dst, &st).unwrap();
+
+        assert_eq!(fs::read(&dst_tmp.0).unwrap(), b"firstsecond");
     }
 
     #[test]

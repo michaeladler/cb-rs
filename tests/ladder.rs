@@ -70,6 +70,34 @@ fn copies_regular_file_byte_for_byte() {
     assert_eq!(fs::read(&dst).unwrap(), expected);
 }
 
+/// `/proc` and some FUSE filesystems report size 0 and still have content. The
+/// copy used to take the size as the amount to move, so those files arrived
+/// empty and the paste reported success.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_file_reporting_size_zero_still_arrives_whole() {
+    let sandbox = Sandbox::new("size-zero");
+    let src = Path::new("/proc/self/cmdline");
+    if !src.exists() {
+        eprintln!("skipping: no /proc");
+        return;
+    }
+    assert_eq!(
+        fs::metadata(src).unwrap().len(),
+        0,
+        "the premise: /proc reports size 0"
+    );
+    let dst = sandbox.path("cmdline");
+
+    let failures = copy_any(src, &dst);
+
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(
+        fs::metadata(&dst).unwrap().len() > 0,
+        "a size-0 source with content must not be copied as empty"
+    );
+}
+
 #[test]
 fn copies_a_large_file() {
     let sandbox = Sandbox::new("large");
@@ -217,7 +245,10 @@ fn a_replaced_directory_is_not_merged_into() {
     assert!(
         !dst.join("stale.txt").exists() && !dst.join("inner/stale.txt").exists(),
         "replace must not merge: {:?}",
-        fs::read_dir(dst.join("inner")).unwrap().flatten().collect::<Vec<_>>()
+        fs::read_dir(dst.join("inner"))
+            .unwrap()
+            .flatten()
+            .collect::<Vec<_>>()
     );
 }
 
