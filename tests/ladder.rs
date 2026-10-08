@@ -204,6 +204,41 @@ fn copy_into_the_folder_the_source_lives_in_keeps_the_file() {
     assert_eq!(fs::read(&src).unwrap(), b"payload");
 }
 
+/// `cb copy d; cd d/sub; cb paste` would otherwise copy the copy, forever.
+/// `rename` answers `EINVAL`, which the mover used to read as "no renameat2
+/// here" and answer with a copy-then-delete into the source itself.
+#[test]
+fn move_into_its_own_subtree_is_refused() {
+    let sandbox = Sandbox::new("subtree-move");
+    let src = sandbox.path("tree");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("sub/inner.txt"), b"inner").unwrap();
+    let dst_dir = src.join("sub");
+
+    let result = move_into(&src, &dst_dir, Policy::Replace);
+
+    assert_eq!(result, Err(rustix::io::Errno::INVAL));
+    assert_eq!(fs::read(src.join("sub/inner.txt")).unwrap(), b"inner");
+    assert_eq!(
+        fs::read_dir(&dst_dir).unwrap().count(),
+        1,
+        "nothing may be written into the source"
+    );
+}
+
+#[test]
+fn copy_into_its_own_subtree_is_refused() {
+    let sandbox = Sandbox::new("subtree-copy");
+    let src = sandbox.path("tree");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("sub/inner.txt"), b"inner").unwrap();
+
+    let failures = copy_any(&src, &src.join("sub/tree"));
+
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(!src.join("sub/tree").exists());
+}
+
 #[test]
 fn move_uses_rename_and_leaves_no_source() {
     let sandbox = Sandbox::new("move-rename");

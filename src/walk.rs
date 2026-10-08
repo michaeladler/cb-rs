@@ -96,7 +96,27 @@ pub fn copy_any(src: &Path, dst: &Path) -> Vec<Failure> {
         report.reject(src, "source and destination are the same file");
         return report.take();
     }
+    if inside_source(src, dst).unwrap_or(false) {
+        report.reject(src, "destination is inside the source");
+        return report.take();
+    }
     crate::progress::track(src, || copy_tree(src, dst))
+}
+
+/// Whether `dst` would land inside the `src` tree, so the copy recurses into its
+/// own output and the move falls back to copying the source into itself.
+///
+/// Both paths are resolved first: the source is recorded absolute and
+/// symlink-free, but the destination is whatever the user typed, so a symlinked
+/// destination directory would otherwise slip past a prefix test on the path.
+pub fn inside_source(src: &Path, dst: &Path) -> IoResult<bool> {
+    let (Ok(src), Some(dst_dir)) = (src.canonicalize(), dst.parent()) else {
+        return Ok(false);
+    };
+    let Ok(dst_dir) = dst_dir.canonicalize() else {
+        return Ok(false);
+    };
+    Ok(dst_dir.starts_with(src))
 }
 
 /// Whether two paths name the same inode, no final symlink followed.

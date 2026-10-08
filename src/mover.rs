@@ -33,6 +33,12 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
     if walk::same_file(src, &dst).unwrap_or(false) {
         return Ok(Outcome::Skipped);
     }
+    // Pasting a directory into its own subtree: `rename` answers `EINVAL`, which
+    // must not be read as "no renameat2 here" and turned into a copy-then-delete
+    // that copies the source into itself until the disk fills.
+    if walk::inside_source(src, &dst).unwrap_or(false) {
+        return Err(Errno::INVAL);
+    }
 
     match rename_noreplace(src, &dst) {
         Ok(()) => return Ok(Outcome::Moved),
@@ -47,7 +53,12 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
             return renameat(CWD, src, CWD, &dst).map(|()| Outcome::Moved);
         }
         // Cross-device, or no `renameat2`: fall back to copy-then-delete.
-        Err(Errno::XDEV | Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => {}
+        // `EINVAL` is deliberately not here: it is what `rename` answers when
+        // the destination is inside the source, and copying there instead of
+        // failing is how the source ends up duplicated inside itself. The
+        // filesystem-does-not-support-the-flag case is reported by
+        // `rename_noreplace` as `OPNOTSUPP`.
+        Err(Errno::XDEV | Errno::NOSYS | Errno::OPNOTSUPP) => {}
         Err(e) => return Err(e),
     }
 
@@ -97,10 +108,12 @@ fn rename_noreplace(src: &Path, dst: &Path) -> IoResult<()> {
         // fall back to `linkat` + `unlinkat`, which fails with `EXIST` instead of
         // overwriting. Directories cannot be linked; the caller turns that back
         // into copy-then-delete.
-        Err(e @ (Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP)) => {
+        Err(Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => {
             let st = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW)?;
             if rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory {
-                return Err(e);
+                // Distinguished from the `EINVAL` that means a destination inside
+                // the source, so the caller reads this as a missing feature.
+                return Err(Errno::OPNOTSUPP);
             }
             linkat(CWD, src, CWD, dst, AtFlags::empty())?;
             // The source is now reachable under both names, so an unlink failure
