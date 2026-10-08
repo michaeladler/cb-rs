@@ -289,6 +289,17 @@ fn record(
         }
     }
 
+    if sources.is_empty() {
+        for error in &errors {
+            eprintln!("cb: {error}");
+        }
+        println!(
+            "{verb} 0 item(s), will {future} on paste, {} failed",
+            errors.len()
+        );
+        return Err(format!("{} failure(s)", errors.len()));
+    }
+
     // Guards the reset, the amend and the write below as one step.
     let _lock = clipboard.lock().map_err(|e| e.to_string())?;
     let mut list = if amend {

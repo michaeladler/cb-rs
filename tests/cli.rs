@@ -316,6 +316,26 @@ fn a_plain_copy_discards_the_pending_move() {
     assert!(sandbox.out("kept/k.txt"));
 }
 
+#[test]
+fn a_failed_plain_record_preserves_the_existing_clipboard() {
+    let sandbox = Sandbox::new("failed-replace");
+    sandbox.ok(&["cut", "moved.txt"]);
+    sandbox.ok(&["copy", "--amend", "kept"]);
+
+    let failed = sandbox.run(&["copy", "missing-a", "missing-b"]);
+    assert_eq!(failed.status.code(), Some(1));
+
+    let listed = sandbox.ok(&["list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        format!(
+            "cut\t{}\ncopy\t{}\n",
+            sandbox.root.join("work/moved.txt").display(),
+            sandbox.root.join("work/kept").display(),
+        )
+    );
+}
+
 /// A copy stays recorded, so a second paste reads the source again rather than
 /// finding an empty clipboard.
 #[test]
