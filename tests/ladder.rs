@@ -147,21 +147,20 @@ fn destination_is_never_an_alias_of_the_original() {
 }
 
 /// The regression the C++ design is vulnerable to: it deletes originals after a
-/// copy it never re-verified. Here the source must survive a failed move.
+/// copy it never re-verified. Here the source must survive a move that cannot
+/// land. Nothing can be written into the destination, so neither the rename nor
+/// a staged copy can complete.
 #[test]
-fn move_leaves_source_intact_when_the_copy_cannot_complete() {
+fn move_leaves_source_intact_when_the_destination_cannot_be_written() {
     let sandbox = Sandbox::new("move-verify");
     let src = sandbox.write("keepme.txt", b"important");
     let dst_dir = sandbox.path("dst");
     fs::create_dir_all(&dst_dir).unwrap();
-    // A non-empty directory under the destination name cannot be replaced by a
-    // file copy, so the copy fails.
-    let blocked = dst_dir.join("keepme.txt");
-    fs::create_dir(&blocked).unwrap();
-    fs::write(blocked.join("blocker"), b"x").unwrap();
+    fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
     let result = move_into(&src, &dst_dir, Policy::Replace);
 
+    fs::set_permissions(&dst_dir, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(
         result.is_err(),
         "a blocked destination must not report success"
@@ -170,6 +169,29 @@ fn move_leaves_source_intact_when_the_copy_cannot_complete() {
         fs::read(&src).unwrap(),
         b"important",
         "source must survive a failed move"
+    );
+}
+
+/// Plain `rename` replaces a file over a directory name only once the directory
+/// is gone. Parking it means the move lands instead of emptying the user's
+/// directory and then failing with `EISDIR`.
+#[test]
+fn a_file_moves_over_an_existing_non_empty_directory() {
+    let sandbox = Sandbox::new("move-over-dir");
+    let src = sandbox.write("keepme.txt", b"important");
+    let dst_dir = sandbox.path("dst");
+    fs::create_dir_all(dst_dir.join("keepme.txt")).unwrap();
+    fs::write(dst_dir.join("keepme.txt/blocker"), b"x").unwrap();
+
+    let outcome = move_into(&src, &dst_dir, Policy::Replace).unwrap();
+
+    assert!(matches!(outcome, Outcome::Moved));
+    assert_eq!(fs::read(dst_dir.join("keepme.txt")).unwrap(), b"important");
+    assert!(!src.exists());
+    assert_eq!(
+        fs::read_dir(&dst_dir).unwrap().count(),
+        1,
+        "no parking leftovers in the destination directory"
     );
 }
 

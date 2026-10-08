@@ -46,11 +46,7 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> IoResult<Outcome
             if !policy.resolve(&dst)? {
                 return Ok(Outcome::Skipped);
             }
-            // Plain `renameat` replaces atomically for files. Directories must
-            // be emptied first, since `rename` will not overwrite a non-empty
-            // directory.
-            clear_destination(&dst)?;
-            return renameat(CWD, src, CWD, &dst).map(|()| Outcome::Moved);
+            return replace_by_rename(src, &dst).map(|()| Outcome::Moved);
         }
         // Cross-device, or no `renameat2`: fall back to copy-then-delete.
         // `EINVAL` is deliberately not here: it is what `rename` answers when
@@ -91,11 +87,7 @@ fn copy_then_commit(src: &Path, dst: &Path, staged: &Path, policy: Policy) -> Io
     if exists(dst)? && !policy.resolve(dst)? {
         return Ok(Outcome::Skipped);
     }
-    // Plain `rename` will not overwrite a non-empty directory, so one that is
-    // still there has to go aside first. Two renames, so a competing writer can
-    // still land between them; nothing here is a single atomic step.
-    clear_destination(dst)?;
-    rustix::fs::rename(staged, dst)?;
+    replace_by_rename(staged, dst)?;
     sync_path(dst)?;
     walk::remove_any(src)?;
     Ok(Outcome::Moved)
@@ -135,23 +127,33 @@ pub fn exists(path: &Path) -> IoResult<bool> {
     }
 }
 
-/// Empty `dst` when it is a directory. Plain `rename` will not overwrite a
-/// non-empty one.
-fn clear_destination(dst: &Path) -> IoResult<()> {
-    let st = statat(CWD, dst, AtFlags::SYMLINK_NOFOLLOW)?;
-    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::Directory {
-        return Ok(());
+/// Rename `src` onto an existing `dst`, whatever `dst` is.
+///
+/// Emptying a destination directory first loses it whenever the rename that
+/// follows fails: a file onto a directory answers `EISDIR`, a directory onto a
+/// file `ENOTDIR`, and neither `EACCES` nor a read-only filesystem is worth
+/// betting a tree on. Moving the old destination aside instead keeps it until
+/// the rename lands, and puts it back if the rename does not.
+fn replace_by_rename(src: &Path, dst: &Path) -> IoResult<()> {
+    if !exists(dst)? {
+        return rustix::fs::rename(src, dst);
     }
-    // `NOFOLLOW`: the `statat` above named a directory, and a symlink swapped in
-    // between must fail the open rather than empty whatever it points at. The
-    // emptying then runs entirely on that fd.
-    let dir_fd = rustix::fs::openat(
-        CWD,
-        dst,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
-        rustix::fs::Mode::empty(),
-    )?;
-    walk::remove_children(&dir_fd)
+    // A private sibling, so the old destination stays on the same filesystem and
+    // the rename that restores it is atomic too.
+    let parked = walk::staged_path(dst)?;
+    renameat(CWD, dst, CWD, &parked)?;
+    match rustix::fs::rename(src, dst) {
+        Ok(()) => {
+            let _ = walk::remove_any(&parked);
+            Ok(())
+        }
+        Err(e) => {
+            // Best effort: the destination name is free again either way, and a
+            // failure here has already been reported to the caller.
+            let _ = renameat(CWD, &parked, CWD, dst);
+            Err(e)
+        }
+    }
 }
 
 /// Flush a freshly copied destination so a power loss cannot leave the source
@@ -305,6 +307,53 @@ mod tests {
 
         assert_eq!(fs::read(&dst).unwrap(), b"new");
         assert!(!src.exists());
+    }
+
+    /// The destination used to be emptied before the rename, so a rename that
+    /// then failed left nothing where the user's file had been.
+    #[test]
+    fn replace_by_rename_restores_the_destination_when_the_rename_fails() {
+        let tmp = Tmp::new("replace-restore");
+        let dst = tmp.0.join("dst");
+        fs::create_dir(&dst).unwrap();
+        fs::write(dst.join("keep.txt"), b"keep").unwrap();
+        let missing = tmp.0.join("gone");
+
+        assert_eq!(
+            replace_by_rename(&missing, &dst),
+            Err(Errno::NOENT),
+            "a missing source cannot be renamed"
+        );
+
+        assert_eq!(
+            fs::read(dst.join("keep.txt")).unwrap(),
+            b"keep",
+            "the old destination must be put back"
+        );
+        let left: Vec<_> = fs::read_dir(&tmp.0).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "no parked copy may survive: {left:?}");
+    }
+
+    /// Plain `rename` will not replace a directory with a file, so the old
+    /// destination used to be emptied and the rename then failed.
+    #[test]
+    fn a_file_replaces_a_non_empty_directory() {
+        let sandbox_dir = Tmp::new("replace-dir");
+        let src = sandbox_dir.0.join("src.txt");
+        fs::write(&src, b"new").unwrap();
+        let dst = sandbox_dir.0.join("dst");
+        fs::create_dir(&dst).unwrap();
+        fs::write(dst.join("stale.txt"), b"old").unwrap();
+
+        replace_by_rename(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"new");
+        assert!(!src.exists(), "the source is consumed by the rename");
+        assert_eq!(
+            fs::read_dir(&sandbox_dir.0).unwrap().count(),
+            1,
+            "the parked directory must not survive"
+        );
     }
 
     #[test]
