@@ -3,7 +3,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicU32, AtomicUsize,
-    Ordering::{AcqRel, Relaxed, Release},
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
 use std::sync::{Arc, Mutex};
 
@@ -59,6 +59,14 @@ fn mknodat<P: rustix::path::Arg, Fd: rustix::fd::AsFd>(
 }
 
 use crate::copy;
+
+/// Which threads walked a directory, so a test can tell a parallel walk from one
+/// that ran on a single thread.
+#[cfg(test)]
+fn walkers() -> &'static Mutex<Vec<std::thread::ThreadId>> {
+    static WALKERS: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+    &WALKERS
+}
 
 #[derive(Debug)]
 pub struct Failure {
@@ -273,38 +281,86 @@ struct DirTask {
 /// Work-stealing over directories: each worker drains its own deque, then steals
 /// from peers. Thousands of small files are latency-bound, so this is where the
 /// wall clock goes.
+/// The shared queue of directories, with a count of what has been pushed and not
+/// yet finished.
+///
+/// `Injector::is_empty` on its own cannot end the walk: a worker part-way
+/// through a directory has not pushed that directory's subdirectories yet, so
+/// every other worker finds the queue empty and exits, and the rest of the tree
+/// is walked by whichever thread happened to take the root. The count says
+/// whether any thread can still produce work.
+///
+/// It cannot reach zero while another worker holds a task: a worker counts a
+/// subdirectory in before it finishes the directory it was walking, so the count
+/// never dips to zero until the last task in flight is done.
+struct Queue {
+    injector: Injector<DirTask>,
+    live: AtomicUsize,
+}
+
+impl Queue {
+    fn with_root(root: DirTask) -> Self {
+        let queue = Self {
+            injector: Injector::new(),
+            live: AtomicUsize::new(0),
+        };
+        queue.push(root);
+        queue
+    }
+
+    fn push(&self, task: DirTask) {
+        // Counted before the task is visible, so a worker can never observe an
+        // empty queue and a zero count for work that is already on its way.
+        self.live.fetch_add(1, Release);
+        self.injector.push(task);
+    }
+
+    /// Whether nothing is left to do, not merely queued.
+    fn drained(&self) -> bool {
+        self.live.load(Acquire) == 0
+    }
+}
+
 fn walk(root: DirTask, report: &Arc<Report>) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let injector = Injector::new();
-    injector.push(root);
+    let queue = Queue::with_root(root);
 
     if threads <= 1 {
         let deque = Worker::new_lifo();
-        run_worker(&deque, &injector, report);
+        run_worker(&deque, &queue, report);
         return;
     }
 
-    let injector = &injector;
+    let queue = &queue;
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(move || {
                 let deque = Worker::new_lifo();
-                run_worker(&deque, injector, report);
+                run_worker(&deque, queue, report);
             });
         }
     });
 }
 
-fn run_worker(deque: &Worker<DirTask>, injector: &Injector<DirTask>, report: &Arc<Report>) {
-    while let Some(task) = next_task(deque, injector) {
-        process(&task, injector, report);
+fn run_worker(deque: &Worker<DirTask>, queue: &Queue, report: &Arc<Report>) {
+    while let Some(task) = next_task(deque, queue) {
+        #[cfg(test)]
+        {
+            let mut seen = walkers().lock().unwrap();
+            let id = std::thread::current().id();
+            if !seen.contains(&id) {
+                seen.push(id);
+            }
+        }
+        process(&task, queue, report);
         // This directory's own entry list is done; once every subdirectory it
         // pushed is also done, `done` applies the source mode.
         task.node.done();
+        queue.live.fetch_sub(1, Release);
     }
 }
 
-fn process(task: &DirTask, injector: &Injector<DirTask>, report: &Arc<Report>) {
+fn process(task: &DirTask, queue: &Queue, report: &Arc<Report>) {
     // `NOFOLLOW` throughout: the task hands out paths, so a directory that
     // was swapped for a symlink between hand-off and open would otherwise
     // be walked, and written through, somewhere else entirely. The
@@ -352,28 +408,34 @@ fn process(task: &DirTask, injector: &Injector<DirTask>, report: &Arc<Report>) {
             task,
             name,
             entry.file_type(),
-            injector,
+            queue,
             report,
         );
     }
 }
 
-/// Every worker shares one injector as the source of new directories; each
-/// keeps the one it is working on locally.
-fn next_task(deque: &Worker<DirTask>, injector: &Injector<DirTask>) -> Option<DirTask> {
+/// Every worker shares one queue as the source of new directories; each keeps the
+/// one it is working on locally.
+///
+/// `None` means the walk is over, so it waits here while another worker is still
+/// walking a directory that has not pushed its own subdirectories yet.
+fn next_task(deque: &Worker<DirTask>, queue: &Queue) -> Option<DirTask> {
     loop {
         if let Some(task) = deque.pop() {
             return Some(task);
         }
-        match injector.steal_batch_and_pop(deque) {
+        match queue.injector.steal_batch_and_pop(deque) {
             Steal::Success(task) => return Some(task),
             Steal::Retry => continue,
             Steal::Empty => {}
         }
-        if injector.is_empty() {
+        if queue.drained() {
             return None;
         }
-        std::thread::yield_now();
+        // The only work left is inside another worker, which will push before it
+        // finishes. Parking briefly beats burning a core on a directory that is
+        // one `readdir` away from handing over its subdirectories.
+        std::thread::sleep(std::time::Duration::from_micros(200));
     }
 }
 
@@ -383,7 +445,7 @@ fn handle_entry(
     task: &DirTask,
     name: &CStr,
     file_type: FileType,
-    injector: &Injector<DirTask>,
+    queue: &Queue,
     report: &Arc<Report>,
 ) {
     let src_path = task.src.join(OsStr::from_bytes(name.to_bytes()));
@@ -421,7 +483,7 @@ fn handle_entry(
         // directory queues many tasks without touching the fd limit. The
         // destination fd opens only when a worker processes the task.
         let node = DirNode::new(mode, dst_path, Some(Arc::clone(&task.node)), report);
-        injector.push(DirTask {
+        queue.push(DirTask {
             src: src_path,
             node,
         });
@@ -767,6 +829,8 @@ mod tests {
 
     use super::*;
 
+    /// Which threads actually did work, so a test can tell a parallel walk from
+    /// one that ran on a single thread.
     struct Tmp(PathBuf);
 
     impl Tmp {
@@ -1110,6 +1174,58 @@ mod tests {
         assert_eq!(
             fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
             0o700,
+        );
+    }
+
+    /// A worker part-way through a directory has not pushed its subdirectories
+    /// yet. `Injector::is_empty` alone let every other worker exit there, so the
+    /// rest of the tree was walked by whichever thread took the root.
+    #[test]
+    fn the_queue_is_only_drained_once_the_last_task_is_finished() {
+        let report = Arc::new(Report::default());
+        let src = Tmp::new("queue").0.join("src");
+        let queue = Queue::with_root(DirTask {
+            src,
+            node: DirNode::new(Mode::RWXU, PathBuf::from("/nowhere"), None, &report),
+        });
+        let deque = Worker::new_lifo();
+
+        let task = next_task(&deque, &queue).expect("the root is queued");
+        assert!(
+            !queue.drained(),
+            "an empty injector must not end the walk while a task is in flight"
+        );
+        drop(task);
+
+        queue.live.fetch_sub(1, Release);
+        assert!(queue.drained());
+        assert!(next_task(&deque, &queue).is_none());
+    }
+
+    /// The walk must spread over the workers, not run on one.
+    #[test]
+    fn a_wide_tree_is_walked_by_more_than_one_thread() {
+        walkers().lock().unwrap().clear();
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() <= 1) {
+            eprintln!("skipping: one thread available");
+            return;
+        }
+        let tmp = Tmp::new("parallel");
+        let src = tmp.path("src");
+        // Wide and deep enough that one thread leaves the rest waiting on it.
+        for i in 0..8 {
+            fs::create_dir_all(src.join(format!("d{i}/inner"))).unwrap();
+            for j in 0..8 {
+                fs::write(src.join(format!("d{i}/inner/f{j}")), b"x").unwrap();
+            }
+        }
+
+        assert!(copy_tree(&src, &tmp.path("dst")).is_empty());
+
+        let threads = walkers().lock().unwrap().len();
+        assert!(
+            threads > 1,
+            "the copy of a wide tree ran on {threads} thread(s)"
         );
     }
 
