@@ -349,6 +349,15 @@ fn default_state_lives_under_its_own_directory() {
     assert!(out.status.success(), "{:?}", out);
 
     let state = sandbox.root.join("state");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(state.join("cb-rs"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
     assert!(
         state.join("cb-rs/0/metadata/copies").exists(),
         "expected the clipboard under state/cb-rs, found: {:?}",

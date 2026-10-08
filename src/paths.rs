@@ -1,6 +1,8 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use rustix::fd::OwnedFd;
@@ -41,7 +43,19 @@ impl Clipboard {
     }
 
     pub fn ensure(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(self.root.join(METADATA))
+        let state = state_root();
+        let fallback = self.root.starts_with(&state) && state == fallback_root();
+        if fallback {
+            ensure_fallback_root(&state)?;
+        }
+        let metadata = self.root.join(METADATA);
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(&metadata)?;
+        if self.root.starts_with(&state) && !fallback {
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
+        }
+        std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(metadata, std::fs::Permissions::from_mode(0o700))
     }
 
     /// A new copy or cut replaces the whole clipboard entry.
@@ -109,7 +123,15 @@ impl Clipboard {
             bytes.push(0);
         }
         let tmp = file.with_extension("new");
-        std::fs::write(&tmp, bytes)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        output.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        output.write_all(&bytes)?;
+        drop(output);
         std::fs::rename(&tmp, file)
     }
 
@@ -148,6 +170,45 @@ fn state_root() -> PathBuf {
     )
 }
 
+fn fallback_root() -> PathBuf {
+    PathBuf::from("/tmp").join(format!(
+        "{STATE_DIR}-{}",
+        rustix::process::getuid().as_raw()
+    ))
+}
+
+fn ensure_fallback_root(root: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) => validate_fallback_root(&metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            match builder.mode(0o700).create(root) {
+                Ok(()) => {
+                    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            validate_fallback_root(&std::fs::symlink_metadata(root)?)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_fallback_root(metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    if metadata.file_type().is_dir()
+        && metadata.uid() == rustix::process::getuid().as_raw()
+        && metadata.mode() & 0o7777 == 0o700
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe clipboard fallback directory",
+        ))
+    }
+}
+
 fn root_from(persist: Option<OsString>, xdg: Option<OsString>, home: Option<OsString>) -> PathBuf {
     if let Some(dir) = persist {
         return PathBuf::from(dir);
@@ -159,10 +220,7 @@ fn root_from(persist: Option<OsString>, xdg: Option<OsString>, home: Option<OsSt
         Some(home) => PathBuf::from(home).join(".local/state").join(STATE_DIR),
         // One directory per user, so two of them cannot share a clipboard. The
         // uid is the only identity a process without `HOME` still has.
-        None => PathBuf::from("/tmp").join(format!(
-            "{STATE_DIR}-{}",
-            rustix::process::getuid().as_raw()
-        )),
+        None => fallback_root(),
     }
 }
 
@@ -218,21 +276,34 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_file_is_not_readable_by_other_users() {
+    fn clipboard_state_and_lists_are_private() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = Tmp::new("lock-mode");
+        let tmp = Tmp::new("private-mode");
         let clipboard = tmp.clipboard();
         drop(clipboard.lock().unwrap());
 
-        let mode = std::fs::metadata(clipboard.root.join("metadata").join("lock"))
+        let root_mode = std::fs::metadata(&clipboard.root)
             .unwrap()
             .permissions()
             .mode()
             & 0o777;
+        assert_eq!(root_mode, 0o700);
+        let metadata = std::fs::metadata(clipboard.root.join("metadata")).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        let lock_mode = std::fs::metadata(clipboard.root.join("metadata").join("lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(lock_mode, 0o600);
+        let file = clipboard.originals();
+        clipboard
+            .write_list(&file, &[PathBuf::from("/secret")])
+            .unwrap();
         assert_eq!(
-            mode, 0o600,
-            "the lists beside the lock name the user's files"
+            std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 
@@ -271,6 +342,32 @@ mod tests {
             root.starts_with("/tmp") && root.file_name().unwrap() != STATE_DIR,
             "a HOME-less process must not share one clipboard with the next user: {root:?}"
         );
+    }
+
+    #[test]
+    fn fallback_rejects_symlinks_and_unsafe_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = Tmp::new("fallback");
+        let target = tmp.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = tmp.0.join("link");
+        symlink(&target, &link).unwrap();
+        assert_eq!(
+            ensure_fallback_root(&link).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            ensure_fallback_root(&target).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ensure_fallback_root(&target).unwrap();
+        let created = tmp.0.join("created");
+        ensure_fallback_root(&created).unwrap();
+        let metadata = std::fs::symlink_metadata(created).unwrap();
+        assert_eq!(metadata.uid(), rustix::process::getuid().as_raw());
+        assert_eq!(metadata.mode() & 0o777, 0o700);
     }
 
     #[test]
