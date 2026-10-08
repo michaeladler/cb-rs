@@ -1,4 +1,6 @@
 use std::env;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use rustix::fd::OwnedFd;
@@ -28,12 +30,12 @@ impl Clipboard {
         }
     }
 
-    /// Absolute sources `paste` moves, one per line.
+    /// Absolute sources `paste` moves.
     pub fn originals(&self) -> PathBuf {
         self.root.join(METADATA).join(ORIGINALS)
     }
 
-    /// Absolute sources `paste` copies, one per line.
+    /// Absolute sources `paste` copies.
     pub fn copies(&self) -> PathBuf {
         self.root.join(METADATA).join(COPIES)
     }
@@ -66,11 +68,20 @@ impl Clipboard {
         Ok(fd)
     }
 
+    /// NUL-separated raw bytes. A newline inside a path would split one entry
+    /// into two, so a `cut` could later move a path the user never selected, and
+    /// `to_string_lossy` would corrupt a path that is not valid UTF-8. A file
+    /// holding such a path also failed `read_to_string` outright, so the whole
+    /// list read as empty.
     pub fn read_list(&self, file: &Path) -> Vec<PathBuf> {
-        let Ok(contents) = std::fs::read_to_string(file) else {
+        let Ok(contents) = std::fs::read(file) else {
             return Vec::new();
         };
-        contents.lines().map(PathBuf::from).collect()
+        contents
+            .split(|b| *b == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| PathBuf::from(OsStr::from_bytes(entry)))
+            .collect()
     }
 
     /// An empty list removes the file, so a consumed clipboard leaves nothing
@@ -85,13 +96,13 @@ impl Clipboard {
             return Ok(());
         }
         self.ensure()?;
-        let mut text = String::new();
+        let mut bytes = Vec::new();
         for path in paths {
-            text.push_str(&path.to_string_lossy());
-            text.push('\n');
+            bytes.extend_from_slice(path.as_os_str().as_encoded_bytes());
+            bytes.push(0);
         }
         let tmp = file.with_extension("new");
-        std::fs::write(&tmp, text)?;
+        std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, file)
     }
 
@@ -133,6 +144,7 @@ fn home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -198,6 +210,54 @@ mod tests {
             .filter(|n| n != "lock")
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("originals")]);
+    }
+
+    /// A newline inside a path used to split one entry into two, so a later
+    /// `paste` moved a path that was never selected.
+    #[test]
+    fn a_path_containing_a_newline_stays_one_entry() {
+        let tmp = Tmp::new("newline");
+        let clipboard = tmp.clipboard();
+        let file = clipboard.originals();
+        let paths = vec![PathBuf::from("/one\n/two"), PathBuf::from("/three")];
+
+        clipboard.write_list(&file, &paths).unwrap();
+
+        assert_eq!(clipboard.read_list(&file), paths);
+    }
+
+    /// `to_string_lossy` would have replaced each invalid byte with U+FFFD, so
+    /// the paste aimed at a path that does not exist.
+    #[test]
+    fn a_path_that_is_not_utf8_survives_a_round_trip() {
+        let tmp = Tmp::new("non-utf8");
+        let clipboard = tmp.clipboard();
+        let file = clipboard.originals();
+        let paths = vec![PathBuf::from(OsStr::from_bytes(b"/\xff\xfe/caf\xc3\xa9"))];
+
+        clipboard.write_list(&file, &paths).unwrap();
+
+        assert_eq!(clipboard.read_list(&file), paths);
+        assert!(
+            clipboard.read_list(&file)[0]
+                .as_os_str()
+                .as_encoded_bytes()
+                .starts_with(b"/\xff")
+        );
+    }
+
+    #[test]
+    fn an_empty_list_leaves_nothing_to_read() {
+        let tmp = Tmp::new("empty-list");
+        let clipboard = tmp.clipboard();
+        let file = clipboard.originals();
+        clipboard
+            .write_list(&file, &[PathBuf::from("/one")])
+            .unwrap();
+
+        clipboard.write_list(&file, &[]).unwrap();
+
+        assert!(clipboard.read_list(&file).is_empty());
     }
 
     #[test]

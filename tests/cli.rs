@@ -404,6 +404,29 @@ fn paste_creates_the_destination_and_names_a_blocked_one_once() {
     assert!(err.contains("blocked"), "{err}");
 }
 
+/// A path with a newline in it used to be split into two entries, so the second
+/// half was a path the user never selected and the paste moved or copied it.
+#[test]
+fn a_path_containing_a_newline_round_trips_as_one_entry() {
+    let sandbox = Sandbox::new("newline-path");
+    let name = "two\nlines.txt";
+    std::fs::write(sandbox.root.join("work").join(name), b"payload").unwrap();
+
+    sandbox.ok(&["cut", name]);
+    let listed = sandbox.ok(&["list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        format!("cut\t{}\n", sandbox.root.join("work").join(name).display()),
+        "the newline must not split the entry"
+    );
+
+    sandbox.ok(&["paste", "-d", "../out"]);
+    assert!(
+        sandbox.out(name),
+        "the selected path must be the one that moves"
+    );
+}
+
 /// Paths are stored absolute, because paste runs in a directory the user never
 /// named. A relative path recorded from `work` would not resolve from `out`.
 #[test]
