@@ -521,6 +521,78 @@ pub fn staged_path(path: &Path) -> IoResult<PathBuf> {
 /// failure partway through leaves a half-written file where a working one was,
 /// every other name of a hard-linked destination changes with it, and a
 /// read-only destination cannot be opened at all.
+/// fsync everything under `path`, so a move that unlinks its source cannot lose
+/// both to a power cut. Directories are synced after their children, so a name
+/// is only ever recorded once what it points at is.
+///
+/// A symlink has no contents to flush, and a fifo or device node has none that
+/// can be read without blocking on a writer or sending bytes to hardware, so
+/// only regular files and directories are opened. The name itself is durable
+/// once its parent directory has been synced.
+pub fn sync_tree(path: &Path) -> IoResult<()> {
+    let st = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)?;
+    match FileType::from_raw_mode(st.st_mode) {
+        FileType::Directory => {
+            let dir = openat(
+                CWD,
+                path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+            sync_dir(&dir)
+        }
+        FileType::RegularFile => {
+            // `NOFOLLOW`: a symlink swapped in since the `statat` must fail here
+            // rather than flush whatever it points at.
+            let file = openat(CWD, path, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())?;
+            copy::commit(&file)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn sync_dir<Fd: AsFd + Copy>(dir_fd: Fd) -> IoResult<()> {
+    let mut dir = Dir::read_from(dir_fd)?;
+    let mut names = Vec::new();
+    for entry in dir.by_ref() {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    for name in &names {
+        match statat(dir_fd, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => match FileType::from_raw_mode(st.st_mode) {
+                FileType::Directory => {
+                    let child = openat(
+                        dir_fd,
+                        name.as_c_str(),
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )?;
+                    sync_dir(&child)?;
+                }
+                FileType::RegularFile => {
+                    let file = openat(
+                        dir_fd,
+                        name.as_c_str(),
+                        OFlags::RDONLY | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )?;
+                    copy::commit(&file)?;
+                }
+                _ => {}
+            },
+            // Raced with a deletion in the copy that produced this tree.
+            Err(Errno::NOENT) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    copy::commit(&dir_fd)
+}
+
 fn copy_regular(
     src_dir: &OwnedFd,
     src_name: &CStr,
@@ -923,6 +995,42 @@ mod tests {
         assert!(copy_other_path(&tmp.path("nope"), &dst, FileType::Fifo).is_err());
 
         assert_eq!(fs::read(&dst).unwrap(), b"keep");
+    }
+
+    /// The cross-device move unlinks the source right after the copy, so
+    /// everything the copy wrote has to be on disk first.
+    #[test]
+    fn sync_tree_walks_files_and_directories() {
+        let tmp = Tmp::new("sync-tree");
+        let tree = tmp.path("tree");
+        fs::create_dir_all(tree.join("a/b")).unwrap();
+        fs::write(tree.join("top"), b"top").unwrap();
+        fs::write(tree.join("a/mid"), b"mid").unwrap();
+        fs::write(tree.join("a/b/deep"), b"deep").unwrap();
+        symlink("tree/top", tmp.path("link")).unwrap();
+
+        sync_tree(&tree).unwrap();
+        sync_tree(&tmp.0.join("link")).unwrap();
+        sync_tree(&tree.join("top")).unwrap();
+
+        assert_eq!(fs::read(tree.join("a/b/deep")).unwrap(), b"deep");
+    }
+
+    #[test]
+    fn sync_tree_does_not_open_a_fifo() {
+        let tmp = Tmp::new("sync-fifo");
+        // `O_RDONLY` on a fifo blocks until a writer arrives; the walk must
+        // reach the parent and not the node.
+        let fifo = tmp.path("p");
+        mknodat(CWD, &fifo, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+
+        sync_tree(&fifo).unwrap();
+    }
+
+    #[test]
+    fn sync_tree_missing_reports_noent() {
+        let tmp = Tmp::new("sync-missing");
+        assert_eq!(sync_tree(&tmp.path("gone")), Err(Errno::NOENT));
     }
 
     #[test]

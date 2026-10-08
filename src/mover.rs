@@ -88,7 +88,10 @@ fn copy_then_commit(src: &Path, dst: &Path, staged: &Path, policy: Policy) -> Io
         return Ok(Outcome::Skipped);
     }
     replace_by_rename(staged, dst)?;
-    sync_path(dst)?;
+    // The whole tree, then the parent: a crash after the source is unlinked must
+    // find the destination readable, contents included, and holding the name.
+    walk::sync_tree(dst)?;
+    sync_parent(dst)?;
     walk::remove_any(src)?;
     Ok(Outcome::Moved)
 }
@@ -156,32 +159,22 @@ fn replace_by_rename(src: &Path, dst: &Path) -> IoResult<()> {
     }
 }
 
-/// Flush a freshly copied destination so a power loss cannot leave the source
-/// deleted and the destination empty.
-fn sync_path(path: &Path) -> IoResult<()> {
-    let fd = rustix::fs::openat(
+/// Flush the directory holding `path`, which is what makes the rename that put
+/// it there durable. No `NOFOLLOW`: the parent's ordinary path semantics are what
+/// the user's destination means.
+fn sync_parent(path: &Path) -> IoResult<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        // A bare name names an entry of the working directory.
+        _ => Path::new("."),
+    };
+    let dir = rustix::fs::openat(
         CWD,
-        path,
-        rustix::fs::OFlags::RDONLY,
+        parent,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
         rustix::fs::Mode::empty(),
     )?;
-    let result = copy::commit(&fd);
-    drop(fd);
-    if result.is_err() {
-        // Directories and special files cannot be opened for fsync this way;
-        // fsync the parent directory instead, which is what makes the rename
-        // or unlink durable.
-        if let Some(parent) = path.parent() {
-            let dir = rustix::fs::openat(
-                CWD,
-                parent,
-                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
-                rustix::fs::Mode::empty(),
-            )?;
-            copy::commit(&dir)?;
-        }
-    }
-    Ok(())
+    copy::commit(&dir)
 }
 
 pub fn prompt_replace(name: &OsStr) -> bool {
@@ -228,45 +221,25 @@ mod tests {
     }
 
     #[test]
-    fn sync_path_regular_file() {
-        let tmp = Tmp::new("sync-file");
+    fn sync_parent_flushes_the_holding_directory() {
+        let tmp = Tmp::new("sync-parent");
         let file = tmp.0.join("f");
         fs::write(&file, b"data").unwrap();
 
-        sync_path(&file).unwrap();
+        sync_parent(&file).unwrap();
 
         assert_eq!(fs::read(&file).unwrap(), b"data");
     }
 
     #[test]
-    fn sync_path_directory() {
-        let tmp = Tmp::new("sync-dir");
-        let dir = tmp.0.join("d");
-        fs::create_dir(&dir).unwrap();
-        fs::write(dir.join("f"), b"x").unwrap();
-
-        sync_path(&dir).unwrap();
+    fn sync_parent_missing_reports_noent() {
+        let tmp = Tmp::new("sync-parent-missing");
+        assert_eq!(sync_parent(&tmp.0.join("gone/f")), Err(Errno::NOENT));
     }
 
     #[test]
-    fn sync_path_missing_reports_noent() {
-        let tmp = Tmp::new("sync-missing");
-        assert_eq!(sync_path(&tmp.0.join("nope")), Err(Errno::NOENT));
-    }
-
-    #[test]
-    fn sync_path_unreadable_file_propagates_error() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = Tmp::new("sync-eacces");
-        let file = tmp.0.join("f");
-        fs::write(&file, b"x").unwrap();
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::File::open(&file).is_ok() {
-            return;
-        }
-
-        assert_eq!(sync_path(&file), Err(Errno::ACCESS));
+    fn sync_parent_tolerates_a_bare_name() {
+        sync_parent(Path::new("f")).unwrap();
     }
 
     #[test]

@@ -184,7 +184,7 @@ fn write_all(dst: &OwnedFd, buf: &[u8]) -> Result<()> {
 
 /// Flush to disk before the caller unlinks the source, so a crash cannot leave
 /// neither file.
-pub fn commit(dst: &OwnedFd) -> Result<()> {
+pub fn commit<Fd: rustix::fd::AsFd>(dst: &Fd) -> Result<()> {
     fsync(dst)
 }
 
