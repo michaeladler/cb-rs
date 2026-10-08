@@ -344,7 +344,7 @@ fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(),
     // The lock covers only reading the lists. Holding it across the paste would
     // block every other `cb` command for the length of the copy; the rewrite
     // that consumes a move goes through `Clipboard::consume`, which takes the
-    // lock again and refuses if another process recorded something in between.
+    // lock again and merges consumed paths into any newer list.
     let (moves, copies) = {
         let _lock = clipboard.lock().map_err(|e| e.to_string())?;
         (
@@ -399,7 +399,7 @@ fn paste_moves(
     }
     match clipboard.consume(&clipboard.originals(), sources, &remaining) {
         Ok(true) => {}
-        Ok(false) => eprintln!("cb: clipboard changed during paste, leaving it alone"),
+        Ok(false) => eprintln!("cb: clipboard changed during paste, merged consumed paths"),
         Err(e) => return Err(e.to_string()),
     }
     if skipped > 0 {

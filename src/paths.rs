@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
@@ -141,13 +142,8 @@ impl Clipboard {
         std::fs::rename(&tmp, file)
     }
 
-    /// Replace `file` with `remaining` only if it still holds exactly `expected`.
-    /// Returns whether the write happened.
-    ///
-    /// A paste does its slow work with the lock released, so the list may have
-    /// moved on by the time it wants to record what it consumed. Writing then
-    /// would discard a `cut` recorded in between; refusing leaves the newer
-    /// entry alone and costs the caller a retry.
+    /// Remove consumed paths from `file`, preserving concurrent additions.
+    /// Returns whether `file` still matched `expected`.
     pub fn consume(
         &self,
         file: &Path,
@@ -155,11 +151,35 @@ impl Clipboard {
         remaining: &[PathBuf],
     ) -> std::io::Result<bool> {
         let _lock = self.lock()?;
-        if self.read_list(file) != expected {
-            return Ok(false);
+        let current = self.read_list(file);
+        let matched = current == expected;
+        if matched {
+            self.write_list(file, remaining)?;
+            return Ok(true);
         }
-        self.write_list(file, remaining)?;
-        Ok(true)
+        let mut pending = HashMap::new();
+        for path in remaining {
+            *pending.entry(path).or_insert(0usize) += 1;
+        }
+        let mut consumed = HashMap::new();
+        for path in expected {
+            match pending.get_mut(path) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => *consumed.entry(path.clone()).or_insert(0usize) += 1,
+            }
+        }
+        let merged = current
+            .into_iter()
+            .filter(|path| match consumed.get_mut(path) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    false
+                }
+                _ => true,
+            })
+            .collect::<Vec<_>>();
+        self.write_list(file, &merged)?;
+        Ok(false)
     }
 }
 
@@ -469,22 +489,34 @@ mod tests {
     }
 
     #[test]
-    fn consume_refuses_when_another_process_recorded_a_path() {
-        let tmp = Tmp::new("consume-clobber");
+    fn consume_merges_when_another_process_records_a_path() {
+        let tmp = Tmp::new("consume-merge");
         let clipboard = tmp.clipboard();
         let file = clipboard.originals();
-        let expected = vec![PathBuf::from("/one")];
+        let expected = vec![PathBuf::from("/one"), PathBuf::from("/two")];
         clipboard.write_list(&file, &expected).unwrap();
         // Another `cb` records a path after the paste read its snapshot.
         clipboard
-            .write_list(&file, &[PathBuf::from("/one"), PathBuf::from("/fresh")])
+            .write_list(
+                &file,
+                &[
+                    PathBuf::from("/one"),
+                    PathBuf::from("/two"),
+                    PathBuf::from("/fresh"),
+                ],
+            )
             .unwrap();
 
-        assert!(!clipboard.consume(&file, &expected, &[]).unwrap());
-
         assert!(
-            clipboard.read_list(&file) == vec![PathBuf::from("/one"), PathBuf::from("/fresh")],
-            "a concurrent cut must survive the paste's rewrite"
+            !clipboard
+                .consume(&file, &expected, &[PathBuf::from("/two")])
+                .unwrap()
+        );
+
+        assert_eq!(
+            clipboard.read_list(&file),
+            vec![PathBuf::from("/two"), PathBuf::from("/fresh")],
+            "a concurrent cut survives while consumed entries are removed"
         );
     }
 }
