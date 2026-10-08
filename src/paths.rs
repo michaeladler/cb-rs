@@ -67,8 +67,13 @@ impl Clipboard {
 
     /// A new copy or cut replaces the whole clipboard entry.
     pub fn reset(&self) -> std::io::Result<()> {
-        let _ = std::fs::remove_file(self.originals());
-        let _ = std::fs::remove_file(self.copies());
+        for file in [self.originals(), self.copies()] {
+            match std::fs::remove_file(file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
         self.ensure()
     }
 
@@ -299,6 +304,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn reset_propagates_list_removal_errors() {
+        let tmp = Tmp::new("reset-error");
+        let clipboard = tmp.clipboard();
+        std::fs::create_dir_all(clipboard.root.join(METADATA)).unwrap();
+        std::fs::write(clipboard.originals(), b"old original").unwrap();
+        std::fs::create_dir(clipboard.copies()).unwrap();
+
+        let error = clipboard.reset().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::IsADirectory);
+        assert!(!clipboard.originals().exists());
     }
 
     #[test]

@@ -202,9 +202,16 @@ fn copy_then_commit(
     replace_by_rename(staged, dst).map_err(|e| replace_failure(src, e))?;
     // The whole tree, then the parent: a crash after the source is unlinked must
     // find the destination readable, contents included, and holding the name.
-    walk::sync_tree(dst).map_err(|e| one(src, e))?;
-    sync_parent(dst).map_err(|e| one(src, e))?;
+    walk::sync_tree(dst).map_err(|e| committed_failure(src, e))?;
+    sync_parent(dst).map_err(|e| committed_failure(src, e))?;
     Ok(Outcome::Moved)
+}
+
+fn committed_failure(src: &Path, error: Errno) -> Vec<Failure> {
+    vec![Failure {
+        path: src.to_path_buf(),
+        reason: format!("destination was replaced, but syncing it failed: {error}"),
+    }]
 }
 
 fn replace_failure(src: &Path, error: ReplaceError) -> Vec<Failure> {
@@ -368,6 +375,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn post_commit_sync_failure_says_destination_was_replaced() {
+        let failures = committed_failure(Path::new("src"), Errno::IO);
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].reason.contains("destination was replaced"));
+        assert!(failures[0].reason.contains(&Errno::IO.to_string()));
     }
 
     #[test]

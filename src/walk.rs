@@ -217,21 +217,39 @@ pub fn copy_walking(src: &Path, dst: &Path, walked: Option<&Walked>) -> Vec<Fail
             reason: "destination is inside the source".to_owned(),
         }];
     }
-    if let Some(parent) = dst.parent() {
-        clean_stale_temps_at_path(parent);
-    }
     crate::progress::track(src, || copy_tree(src, dst, walked))
 }
 
 /// Whether `dst` would land inside the `src` tree, so the copy recurses into its
 /// own output and the move falls back to copying the source into itself.
 ///
-/// Both paths are resolved first: the source is recorded absolute and
-/// symlink-free, but the destination is whatever the user typed, so a symlinked
-/// destination directory would otherwise slip past a prefix test on the path.
+/// Resolve source parent and destination directory, but leave source's final
+/// component untouched so a symlink source is checked as a link, not its target.
 pub fn inside_source(src: &Path, dst: &Path) -> IoResult<bool> {
-    let (Ok(src), Some(dst_dir)) = (src.canonicalize(), dst.parent()) else {
+    let src = match (src.parent(), src.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            let Ok(parent) = parent.canonicalize() else {
+                return Ok(false);
+            };
+            parent.join(name)
+        }
+        _ => match src.canonicalize() {
+            Ok(src) => src,
+            Err(_) => return Ok(false),
+        },
+    };
+    let Some(dst_dir) = dst.parent() else {
         return Ok(false);
+    };
+    let dst_dir = if dst_dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dst_dir
     };
     let Ok(dst_dir) = dst_dir.canonicalize() else {
         return Ok(false);
@@ -481,7 +499,6 @@ fn process(task: &DirTask, queue: &Queue, report: &Arc<Report>) {
             return;
         }
     };
-    clean_stale_temps(&dst_fd);
     let mut dir = match Dir::read_from(&src_fd) {
         Ok(dir) => dir,
         Err(e) => {
@@ -1568,8 +1585,18 @@ mod tests {
         assert_eq!(fs::read(&dst).unwrap(), b"keep");
     }
 
-    /// The cross-device move unlinks the source right after the copy, so
-    /// everything the copy wrote has to be on disk first.
+    #[test]
+    fn inside_source_does_not_follow_the_source_symlink() {
+        let tmp = Tmp::new("inside-symlink");
+        let target = tmp.path("target");
+        fs::create_dir_all(target.join("sub")).unwrap();
+        let link = tmp.path("link");
+        symlink(&target, &link).unwrap();
+
+        assert!(!inside_source(&link, &target.join("sub/link")).unwrap());
+        assert!(inside_source(&target, &target.join("sub/child")).unwrap());
+    }
+
     #[test]
     fn sync_tree_walks_files_and_directories() {
         let tmp = Tmp::new("sync-tree");
