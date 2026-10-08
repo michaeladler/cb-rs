@@ -87,14 +87,13 @@ fn clone_any(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
         // `/proc` and `/sys` report 0 and still have content, and a file that
         // grows while it is read must not be cut short at the size the stat saw.
         // So copy until the kernel says EOF, which is also where `cp` stops.
-        let mut eof = false;
+        let mut copied = false;
         while NO_CFR.load(Relaxed) != key {
             match copy_file_range(src, None, dst, None, CFR_MAX as usize) {
-                Ok(0) => {
-                    eof = true;
-                    break;
-                }
+                Ok(0) if copied => return Ok(Method::CopyFileRange),
+                Ok(0) => break,
                 Ok(n) => {
+                    copied = true;
                     BYTES.fetch_add(n as u64, Relaxed);
                 }
                 Err(e) if unavailable(e) => {
@@ -103,9 +102,6 @@ fn clone_any(src: &OwnedFd, dst: &OwnedFd, src_st: &Stat) -> Result<Method> {
                 }
                 Err(e) => return Err(e),
             }
-        }
-        if eof {
-            return Ok(Method::CopyFileRange);
         }
     }
 
@@ -285,6 +281,20 @@ mod tests {
         let dst = tmp.open();
         let write_only: OwnedFd = OpenOptions::new().write(true).open(&tmp.0).unwrap().into();
         assert!(copy_stream(&write_only, &dst).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_copy_falls_back_when_copy_file_range_returns_zero() {
+        let (src_path, dst_tmp) = ("/proc/self/cmdline", Tmp::new("procfs"));
+        let expected = fs::read(src_path).unwrap();
+        let src: OwnedFd = File::open(src_path).unwrap().into();
+        let st = rustix::fs::fstat(&src).unwrap();
+
+        clone_file(&src, &dst_tmp.open(), &st).unwrap();
+
+        assert!(!expected.is_empty());
+        assert_eq!(fs::read(&dst_tmp.0).unwrap(), expected);
     }
 
     #[test]
