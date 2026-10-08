@@ -259,7 +259,7 @@ fn is_yes(answer: &str) -> bool {
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use crate::policy::Policy;
 
@@ -460,6 +460,25 @@ mod tests {
 
     /// `copy_into` stages under a private name and renames in, so the policy is
     /// consulted against the destination again after the copy, not once.
+    /// The commit path flushed the destination by opening it `O_RDONLY`, which
+    /// follows a symlink: a dangling one answered `ENOENT` after the rename had
+    /// already landed, so the move failed and left the source behind as well.
+    #[test]
+    fn a_dangling_symlink_reaches_the_destination() {
+        let tmp = Tmp::new("sym-commit");
+        let src = tmp.0.join("link");
+        let out = tmp.0.join("out");
+        fs::create_dir(&out).unwrap();
+        let dst = out.join("link");
+        let staged = walk::staged_path(&dst).unwrap();
+        std::os::unix::fs::symlink("nowhere", &src).unwrap();
+
+        let outcome = copy_then_commit(&src, &dst, &staged, Policy::Skip).map_err(|f| f.len());
+
+        assert_eq!(outcome, Ok(Outcome::Moved));
+        assert_eq!(fs::read_link(&dst).unwrap(), Path::new("nowhere"));
+    }
+
     #[test]
     fn copy_into_declines_an_existing_destination_and_keeps_the_source() {
         let tmp = Tmp::new("copy-decline");

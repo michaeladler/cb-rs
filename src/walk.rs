@@ -819,7 +819,10 @@ mod tests {
         let (src_dir, dst_dir) = (tmp.subdir("src"), tmp.subdir("dst"));
         mknodat(&src_dir, c"p", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
 
-        assert_eq!(copy_regular(&src_dir, c"p", &dst_dir, c"p"), Err(Errno::INVAL));
+        assert_eq!(
+            copy_regular(&src_dir, c"p", &dst_dir, c"p"),
+            Err(Errno::INVAL)
+        );
         assert_eq!(fs::read_dir(tmp.path("dst")).unwrap().count(), 0);
     }
 
@@ -1054,11 +1057,19 @@ mod tests {
         fs::write(tree.join("top"), b"top").unwrap();
         fs::write(tree.join("a/mid"), b"mid").unwrap();
         fs::write(tree.join("a/b/deep"), b"deep").unwrap();
-        symlink("tree/top", tmp.path("link")).unwrap();
+        // A dangling link: opening it `O_RDONLY` answers `ENOENT`, which after a
+        // rename that already happened left the move reporting a failure and the
+        // source still in place.
+        symlink("nowhere", tmp.path("link")).unwrap();
 
         sync_tree(&tree).unwrap();
         sync_tree(&tmp.0.join("link")).unwrap();
         sync_tree(&tree.join("top")).unwrap();
+
+        assert_eq!(
+            fs::read_link(tmp.path("link")).unwrap(),
+            Path::new("nowhere")
+        );
 
         assert_eq!(fs::read(tree.join("a/b/deep")).unwrap(), b"deep");
     }
