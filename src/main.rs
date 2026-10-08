@@ -131,9 +131,12 @@ fn normalise(argv: Vec<String>) -> Vec<String> {
         } else if let Some((flag, value)) = arg.split_once('=').filter(|_| arg.starts_with("--")) {
             out.push(flag.to_string());
             out.push(value.to_string());
-        } else if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 2 {
-            out.push(arg[..2].to_string());
-            out.push(arg[2..].to_string());
+        } else if (arg.starts_with("-n") || arg.starts_with("-d"))
+            && let Some((split, _)) = arg.char_indices().nth(2)
+        {
+            let (flag, value) = arg.split_at(split);
+            out.push(flag.to_string());
+            out.push(value.to_string());
         } else {
             out.push(arg);
         }
@@ -462,6 +465,20 @@ fn report(succeeded: usize, failures: &[Failure], verb: &str) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalise_splits_only_attached_value_options_at_char_boundaries() {
+        assert_eq!(
+            normalise(
+                ["-nprobe", "-d/tmp", "-an", "-weird", "-évalue"]
+                    .map(str::to_owned)
+                    .to_vec()
+            ),
+            ["-n", "probe", "-d", "/tmp", "-an", "-weird", "-évalue"]
+                .map(str::to_owned)
+                .to_vec()
+        );
+    }
 
     fn leftover() -> Failure {
         Failure {
