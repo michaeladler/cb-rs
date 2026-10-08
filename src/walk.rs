@@ -403,7 +403,15 @@ fn process(task: &DirTask, queue: &Queue, report: &Arc<Report>) {
         }
     };
     for entry in dir.by_ref() {
-        let Ok(entry) = entry else { continue };
+        // An entry the walk never read is never copied, yet the copy still
+        // reports success, and a cross-device move then deletes the source.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                report.fail(&task.src, e);
+                continue;
+            }
+        };
         let name = entry.file_name();
         if name == c"." || name == c".." {
             continue;
@@ -623,7 +631,10 @@ fn sync_dir<Fd: AsFd + Copy>(dir_fd: Fd) -> IoResult<()> {
     let mut dir = Dir::read_from(dir_fd)?;
     let mut names = Vec::new();
     for entry in dir.by_ref() {
-        let Ok(entry) = entry else { continue };
+        // Same as the walk: a `readdir` that fails part-way leaves names that
+        // were never listed, so the destination is not the whole tree. Answering
+        // `Ok` here is what lets the move unlink the source anyway.
+        let entry = entry?;
         let name = entry.file_name();
         if name == c"." || name == c".." {
             continue;
@@ -803,17 +814,29 @@ fn remove_entry<Fd: AsFd + Copy, P: Arg + Copy>(dir_fd: Fd, name: P) -> IoResult
 /// directory swapped for a symlink mid-walk cannot redirect the delete into
 /// its target.
 pub fn remove_children<Fd: AsFd + Copy>(dir_fd: Fd) -> IoResult<()> {
+    let mut first_err = None;
     let mut dir = Dir::read_from(dir_fd)?;
     let mut names = Vec::new();
     for entry in dir.by_ref() {
-        let Ok(entry) = entry else { continue };
+        // A `readdir` that fails part-way has names it never yielded; they are
+        // still deleted by the caller's next attempt, but the failure has to
+        // reach it, or the move that owns this delete reports a tree it did
+        // not remove as removed.
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                break;
+            }
+        };
         let name = entry.file_name();
         if name == c"." || name == c".." {
             continue;
         }
         names.push(name.to_owned());
     }
-    let mut first_err = None;
     for name in &names {
         if let Err(e) = remove_entry(dir_fd, name.as_c_str())
             && first_err.is_none()
@@ -1159,6 +1182,43 @@ mod tests {
     fn sync_tree_missing_reports_noent() {
         let tmp = Tmp::new("sync-missing");
         assert_eq!(sync_tree(&tmp.path("gone")), Err(Errno::NOENT));
+    }
+
+    /// A `readdir` that fails part-way leaves names the walk never saw. If that
+    /// answers "no entries", the tree looks complete, the move deletes the
+    /// source, and files are gone that were never copied.
+    #[test]
+    fn a_failed_readdir_is_not_an_empty_directory() {
+        let tmp = Tmp::new("readdir-fail");
+        let file = File::create(tmp.path("f")).unwrap();
+
+        assert_eq!(sync_dir(&file).unwrap_err(), Errno::NOTDIR);
+        assert_eq!(remove_children(&file).unwrap_err(), Errno::NOTDIR);
+    }
+
+    /// The walk's own directory open is the one failure a copy reports for every
+    /// entry underneath, so a source it cannot read must not look copied.
+    #[test]
+    fn an_unreadable_source_directory_is_reported() {
+        use std::os::unix::fs::MetadataExt;
+
+        if std::fs::metadata(".").unwrap().uid() == 0 {
+            eprintln!("skipping: root reads anything");
+            return;
+        }
+        let tmp = Tmp::new("unreadable-src");
+        fs::create_dir_all(tmp.path("src/ro")).unwrap();
+        fs::write(tmp.path("src/ro/secret"), b"x").unwrap();
+        fs::set_permissions(tmp.path("src/ro"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        let failures = copy_tree(&tmp.path("src"), &tmp.path("dst"));
+        fs::set_permissions(tmp.path("src/ro"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            failures.iter().any(|f| f.path == tmp.path("src/ro")),
+            "a directory the walk cannot read must be a failure, not a silent skip: {failures:?}"
+        );
+        assert!(!tmp.path("dst/ro/secret").exists());
     }
 
     #[test]
