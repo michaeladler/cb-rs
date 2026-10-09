@@ -256,9 +256,9 @@
 
           ci = pkgs.mkShell {
             nativeBuildInputs = [
-              pkgs.nfpm
-              pkgs.zstd
-              pkgs.git-cliff
+              pkgs.goreleaser
+              pkgs.cargo-zigbuild
+              pkgs.zig
             ];
           };
         }

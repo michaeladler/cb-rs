@@ -39,7 +39,7 @@ jobs:
         run: nix profile add nixpkgs#devenv
 
       - name: goreleaser
-        shell: devenv shell --profile release -- bash -e {0}
+        shell: 'nix develop .#ci -c bash -e {0}'
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             goreleaser release --clean
