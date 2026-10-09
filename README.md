@@ -1,6 +1,6 @@
 [![ci](https://github.com/michaeladler/cb-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/michaeladler/cb-rs/actions/workflows/ci.yml)
 [![bench](https://github.com/michaeladler/cb-rs/actions/workflows/bench.yml/badge.svg)](https://github.com/michaeladler/cb-rs/actions/workflows/bench.yml)
-[![codecov](https://codecov.io/github/michaeladler/cb-rs/graph/badge.svg?token=hGEBYzrSIB)](https://codecov.io/github/michaeladler/cb-rs)
+[[![Release](https://github.com/michaeladler/cb-rs/actions/workflows/release.yml/badge.svg)](https://github.com/michaeladler/cb-rs/actions/workflows/release.yml)![codecov](https://codecov.io/github/michaeladler/cb-rs/graph/badge.svg?token=hGEBYzrSIB)](https://codecov.io/github/michaeladler/cb-rs)
 
 # cb-rs
 
