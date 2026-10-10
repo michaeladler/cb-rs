@@ -60,7 +60,7 @@ cb paste -d /tmp/out          # moves it
 
 Neither verb reads a file. Both record absolute source paths, and `paste` does the reading, so a recorded clipboard costs a few bytes per path no matter how large the tree is, and a copy that is never pasted costs nothing at all.
 
-That makes them composable. `--amend` adds to the current clipboard instead of replacing it, so one paste can move some entries and copy others:
+That makes them composable. `-a`/`--amend` adds to the current clipboard instead of replacing it, so one paste can move some entries and copy others:
 
 ```sh
 cb cut old-build/             # wipes the clipboard, records the paths
@@ -81,7 +81,7 @@ Or from a clone: `cargo build --release`.
 Read these before pointing `cb-rs` at anything you care about.
 
 - A new `copy` or `cut` wipes the clipboard unless you pass `--amend`. Both lists are removed first. There is no history.
-- `paste` creates `-d` if it is missing, `mkdir -p` style, whole missing parents included, and fails if the path exists as something other than a directory. `--on-conflict skip|replace|ask` (default `skip`) decides what happens when a top-level entry already exists, and paste never merges: the whole entry is skipped, replaced, or, under `replace`, **emptied and renamed over** — replacing a directory deletes everything in it.
+- `paste` creates `-d` if it is missing, `mkdir -p` style, whole missing parents included, and fails if the path exists as something other than a directory. `--on-conflict skip|replace|ask` (default `skip`) decides what happens when a top-level entry already exists, and paste never merges: the whole entry is skipped, or the new one is renamed over the old. Under `replace` the old destination is first moved aside to a `.cb-parked` sibling and only deleted once the rename has landed; if the rename fails it is moved back, so a `replace` never deletes first.
 - `copy` and `cut` record paths, not bytes, and nothing is read at record time. Editing, moving, or deleting a source before you paste means paste acts on whatever is at that path now, or fails. It is not a snapshot, so `cb copy f && rm f` followed by a paste will not produce `f`. Use `cp` if you want the bytes now.
 - Paste of copied paths does not empty the clipboard. The sources stay recorded, so a second paste copies them again. Only `cut` consumes.
 - `ask` needs a terminal. With stdin not a tty it answers no, so it behaves like `skip`.
@@ -119,7 +119,7 @@ Caveats above cover the semantics; this is where the speed comes from.
 
 ## State
 
-`$XDG_STATE_HOME/cb-rs/<name>` (falling back to `~/.local/state/cb-rs`), or whatever `CLIPBOARD_PERSISTDIR` points at. `<name>` is `0` unless you pass `-n`/`--name`.
+`$XDG_STATE_HOME/cb-rs/<name>` (falling back to `~/.local/state/cb-rs`, or to `/tmp/cb-rs-<uid>` when there is no `HOME`), or whatever `CLIPBOARD_PERSISTDIR` points at. `<name>` is `0` unless you pass `-n`/`--name`.
 `<name>/metadata/originals` holds the absolute sources recorded by `cut`, `<name>/metadata/copies` the ones recorded by `copy`. Neither holds file data: `paste` reads the sources themselves, so a large tree costs one line per top-level entry.
 
 This is deliberately a different directory from the C++ `cb`'s `$XDG_STATE_HOME/clipboard`. The two tools cannot read each other's clipboards, and sharing the directory would have been worse than useless: every upstream entry holds real bytes, and `cb clear` or a history trim under a byte, age or count limit deletes an entry outright, which under the shared root took the other tool's staged data with it. `cb-rs` stages nothing, so it keeps two small lists and nothing else.
@@ -141,20 +141,28 @@ Changing `Cargo.toml` or `Cargo.lock` needs a fresh `nix develop` so the vendor 
 ## Test
 
 ```sh
-cargo test
+nix flake check
+```
+
+One check at a time, with the logs of the failing one:
+
+```sh
+nix build .#checks.x86_64-linux.my-crate-nextest --no-link --print-build-logs
 ```
 
 The reflink and cross-device tests need a CoW volume: `scripts/testvol.sh <btrfs|xfs|ext4|zfs> [mountpoint]` creates and mounts a sparse loopback image on `./mount-<fs>` and prints where it is. Point `CB_TESTVOL_DIR` at the mount; with no volume and no env var those tests skip.
 
 ## Man page and shell completions
 
-See [`man/cb.1`](man/cb.1) and [`completions/`](completions). Copy them where your shell and your system look:
+See [`share/man/cb.1`](share/man/cb.1) and [`share/completions/`](share/completions). Copy them where your shell and your system look:
 
 ```sh
-install -Dm644 man/cb.1              /usr/local/share/man/man1/cb.1
-install -Dm644 completions/cb.bash   /etc/bash_completion.d/cb
-install -Dm644 completions/_cb       ~/.local/share/zsh/site-functions/_cb
-install -Dm644 completions/cb.fish   ~/.config/fish/completions/cb.fish
-install -Dm644 completions/cb.elv    ~/.config/elvish/lib/cb.elv
-install -Dm644 completions/_cb.ps1   ~/.config/powershell/cb.ps1
+install -Dm644 share/man/cb.1              /usr/local/share/man/man1/cb.1
+install -Dm644 share/completions/cb.bash   /usr/local/share/bash-completion/completions/cb
+install -Dm644 share/completions/_cb       ~/.local/share/zsh/site-functions/_cb
+install -Dm644 share/completions/cb.fish   /usr/local/share/fish/vendor_completions.d/cb.fish
+install -Dm644 share/completions/cb.elv    ~/.config/elvish/lib/cb.elv
+install -Dm644 share/completions/_cb.ps1   ~/.config/powershell/cb.ps1
 ```
+
+The man page and the bash, zsh and fish completions are installed by the flake package and by the release archives and the `deb`/`rpm` packages; the copy above is only needed for a `cargo build` binary. Nothing generates them from the CLI, so they are frozen artefacts, and `tests/docs.rs` checks they are present and still describe cb.
