@@ -15,15 +15,6 @@ cols=100
 rows=24
 session=cb-demo-$$
 
-for tool in tmux asciinema agg cargo; do
-    command -v $tool >/dev/null || {
-                                  echo "missing: $tool" >&2
-                                                             exit 1
-    }
-done
-
-cargo build --release --quiet --manifest-path "$root/Cargo.toml"
-
 # The playground lives on the repo filesystem, not /tmp: `cb paste` only draws a
 # progress bar after DELAY, so the copy has to be slow enough to see, and a
 # tmpfs copy of the same bytes finishes before the bar ever appears.
@@ -34,16 +25,15 @@ export HOME=$work/home
 # A fixed, short state path keeps `cb list` output readable in the demo.
 export CLIPBOARD_PERSISTDIR=/tmp/cb-demo-state
 rm -rf "$CLIPBOARD_PERSISTDIR"
-export PATH=$root/target/release:$PATH
 export TERM=xterm-256color
 unset XDG_STATE_HOME
 
 # The playground is built here instead of in the recorded script: assembling it
 # is not the demo, and a silent setup would trip asciinema's --idle-time-limit.
 demo=$work/home/demo
-mkdir -p "$demo/notes" "$demo/build" "$demo/images/raw"
+mkdir -p "$demo/notes" "$demo/src" "$demo/images/raw"
 echo 'ship it' >"$demo/notes/todo.md"
-echo 'int main() {}' >"$demo/build/main.c"
+echo 'int main() {}' >"$demo/src/main.c"
 # One file per subdirectory: the walk gives each directory its own worker but
 # copies the files inside one sequentially, so siblings of photo.bin would all
 # land before or after it instead of during. Doubling sizes then spreads the

@@ -239,14 +239,8 @@
               pkgs.zstd
               cargoDebugArtifacts
               reseedTarget
-
               pkgs.btrfs-progs
               pkgs.xfsprogs
-
-              pkgs.tmux
-              pkgs.asciinema
-              pkgs.agg
-              pkgs.demo-magic
             ]
             ++ commonArgs.buildInputs;
 
@@ -268,6 +262,16 @@
               pkgs.goreleaser
               pkgs.cargo-zigbuild
               pkgs.zig
+            ];
+          };
+
+          demo = pkgs.mkShell {
+            nativeBuildInputs = [
+              pkgs.tmux
+              pkgs.asciinema
+              pkgs.agg
+              pkgs.demo-magic
+              self.packages.${system}.default
             ];
           };
         }

@@ -35,7 +35,7 @@ pe "cb paste -d out"
 pe "tree out"
 
 p "# cut records paths too, and paste moves them"
-pe "cb cut build"
+pe "cb cut src"
 
 p "# --amend adds to the clipboard instead of replacing it"
 pe "cb copy --amend notes/todo.md"
@@ -46,5 +46,5 @@ pe "tree mixed"
 
 # `pe` swallows the exit status of each step, so assert the end state here:
 # the recorder fails the run when this script exits non-zero.
-test -d ~/demo/mixed/build && test -f ~/demo/mixed/todo.md &&
-    ! test -e ~/demo/build && test -f ~/demo/notes/todo.md
+test -d ~/demo/mixed/src && test -f ~/demo/mixed/todo.md &&
+    ! test -e ~/demo/src && test -f ~/demo/notes/todo.md
