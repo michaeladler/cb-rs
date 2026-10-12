@@ -64,8 +64,11 @@ Destination directory, defaults to the current one
 \fB\-n\fR, \fB\-\-name\fR \fI<NAME>\fR
 Clipboard to use, instead of the default
 .TP
-\fB\-\-on\-conflict\fR \fI<ON_CONFLICT>\fR [default: skip]
+\fB\-\-on\-conflict\fR \fI<ON_CONFLICT>\fR
 What to do when a destination file already exists
+.RS
+Default: ask when stdin is a terminal; skip otherwise.
+.RE
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help

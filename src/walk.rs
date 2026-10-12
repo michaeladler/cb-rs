@@ -302,6 +302,182 @@ pub fn same_file(a: &Path, b: &Path) -> IoResult<bool> {
     Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
 }
 
+/// Whether `dst` already holds exactly what `src` holds, so that pasting over
+/// it would write nothing the user can lose.
+///
+/// Regular files compare bytes, symlinks compare targets, and directories
+/// compare tree shape. Mode and timestamps do not affect content equality.
+///
+/// Any error answers "no". A pair that cannot be compared must go on to the
+/// policy, which asks; a wrong "yes" would let a `cut` delete a source whose
+/// contents were never checked.
+pub fn identical(src: &Path, dst: &Path) -> bool {
+    let mut pending = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((src, dst)) = pending.pop() {
+        if !same_entry(&src, &dst, &mut pending) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compare one entry, pushing the pairs a directory match puts below it.
+///
+/// An explicit stack rather than recursion, like the rest of this module: each
+/// level would otherwise cost a frame and two descriptors, and the trees this
+/// runs over are exactly the ones that are too deep to guess.
+fn same_entry(src: &Path, dst: &Path, pending: &mut Vec<(PathBuf, PathBuf)>) -> bool {
+    let (Ok(a), Ok(b)) = (
+        statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW),
+        statat(CWD, dst, AtFlags::SYMLINK_NOFOLLOW),
+    ) else {
+        return false;
+    };
+    let file_type = FileType::from_raw_mode(a.st_mode);
+    if file_type != FileType::from_raw_mode(b.st_mode) {
+        return false;
+    }
+    if a.st_dev == b.st_dev && a.st_ino == b.st_ino {
+        // A shared directory could be emptied through both names during cleanup.
+        return file_type != FileType::Directory;
+    }
+    match file_type {
+        FileType::Directory => same_entries(src, dst, pending, &a, &b),
+        // Size first: it rules out nearly every pair that is not actually
+        // equal without reading either of them.
+        FileType::RegularFile => a.st_size == b.st_size && same_bytes(src, dst, &a, &b),
+        FileType::Symlink => {
+            let (Ok(src_target), Ok(dst_target)) = (
+                rustix::fs::readlink(src, Vec::new()),
+                rustix::fs::readlink(dst, Vec::new()),
+            ) else {
+                return false;
+            };
+            src_target == dst_target
+                && statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|st| same_file_version(&a, &st))
+                && statat(CWD, dst, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|st| same_file_version(&b, &st))
+        }
+        // A fifo, socket or device node is named by its mode and the device it
+        // points at, and has no contents to compare.
+        _ => {
+            a.st_rdev == b.st_rdev
+                && Mode::from_raw_mode(a.st_mode) == Mode::from_raw_mode(b.st_mode)
+                && statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|st| same_file_version(&a, &st))
+                && statat(CWD, dst, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|st| same_file_version(&b, &st))
+        }
+    }
+}
+
+fn same_entries(
+    src: &Path,
+    dst: &Path,
+    pending: &mut Vec<(PathBuf, PathBuf)>,
+    src_stat: &Stat,
+    dst_stat: &Stat,
+) -> bool {
+    let oflags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    let (Ok(a), Ok(b)) = (
+        openat(CWD, src, oflags, Mode::empty()),
+        openat(CWD, dst, oflags, Mode::empty()),
+    ) else {
+        return false;
+    };
+    let (Ok(a_before), Ok(b_before)) = (rustix::fs::fstat(&a), rustix::fs::fstat(&b)) else {
+        return false;
+    };
+    if !same_file_version(src_stat, &a_before) || !same_file_version(dst_stat, &b_before) {
+        return false;
+    }
+    let mut read_err = None;
+    let mut left = entry_names(&a, &mut read_err);
+    let mut right = entry_names(&b, &mut read_err);
+    // A `readdir` that fails part-way reports names it never yielded, so the
+    // two listings cannot be compared and the answer is "no", not "equal".
+    if read_err.is_some() {
+        return false;
+    }
+    left.sort_unstable();
+    right.sort_unstable();
+    if left != right {
+        return false;
+    }
+    let (Ok(a_after), Ok(b_after)) = (rustix::fs::fstat(&a), rustix::fs::fstat(&b)) else {
+        return false;
+    };
+    if !same_file_version(&a_before, &a_after) || !same_file_version(&b_before, &b_after) {
+        return false;
+    }
+    pending.extend(left.iter().zip(&right).map(|(x, y)| {
+        (
+            src.join(OsStr::from_bytes(x.to_bytes())),
+            dst.join(OsStr::from_bytes(y.to_bytes())),
+        )
+    }));
+    true
+}
+
+/// Stream both files to EOF and compare BLAKE3 digests.
+///
+/// Size and metadata checks reject changes during comparison; only a fixed-size
+/// buffer stays resident regardless of file size.
+fn same_bytes(src: &Path, dst: &Path, a_stat: &Stat, b_stat: &Stat) -> bool {
+    let (Ok(a), Ok(b)) = (open_regular(CWD, src), open_regular(CWD, dst)) else {
+        return false;
+    };
+    let (Ok(a_before), Ok(b_before)) = (rustix::fs::fstat(&a), rustix::fs::fstat(&b)) else {
+        return false;
+    };
+    if !same_file_version(a_stat, &a_before)
+        || !same_file_version(b_stat, &b_before)
+        || a_before.st_size != b_before.st_size
+        || a_before.st_size < 0
+    {
+        return false;
+    }
+    let (Ok((a_hash, a_len)), Ok((b_hash, b_len))) = (hash_file(&a), hash_file(&b)) else {
+        return false;
+    };
+    let (Ok(a_after), Ok(b_after)) = (rustix::fs::fstat(&a), rustix::fs::fstat(&b)) else {
+        return false;
+    };
+    a_hash == b_hash
+        && a_len == a_before.st_size as u64
+        && b_len == b_before.st_size as u64
+        && same_file_version(&a_before, &a_after)
+        && same_file_version(&b_before, &b_after)
+}
+
+fn same_file_version(a: &Stat, b: &Stat) -> bool {
+    a.st_dev == b.st_dev
+        && a.st_ino == b.st_ino
+        && a.st_size == b.st_size
+        && a.st_mtime == b.st_mtime
+        && a.st_mtime_nsec == b.st_mtime_nsec
+        && a.st_ctime == b.st_ctime
+        && a.st_ctime_nsec == b.st_ctime_nsec
+}
+
+fn hash_file(fd: &OwnedFd) -> IoResult<(blake3::Hash, u64)> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut length = 0;
+    loop {
+        match rustix::io::read(fd, &mut buffer) {
+            Ok(0) => return Ok((hasher.finalize(), length)),
+            Ok(n) => {
+                hasher.update(&buffer[..n]);
+                length += n as u64;
+            }
+            Err(Errno::INTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn copy_tree(src: &Path, dst: &Path, walked: Option<&Walked>) -> Vec<Failure> {
     let report = Arc::new(Report {
         walked: walked.cloned(),
@@ -1333,6 +1509,68 @@ mod tests {
             reset(&self.0);
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn identical_compares_file_bytes_tree_shape_and_symlink_target() {
+        let tmp = Tmp::new("identical");
+        let src = tmp.path("src");
+        let dst = tmp.path("dst");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::create_dir_all(dst.join("nested")).unwrap();
+        fs::write(src.join("nested/file"), b"same bytes").unwrap();
+        fs::write(dst.join("nested/file"), b"same bytes").unwrap();
+        symlink("nested/file", src.join("link")).unwrap();
+        symlink("nested/file", dst.join("link")).unwrap();
+        // Different metadata does not alter content equality.
+        fs::set_permissions(dst.join("nested/file"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(identical(&src, &dst));
+
+        fs::write(dst.join("nested/file"), b"diff bytes").unwrap();
+        assert!(!identical(&src, &dst));
+        fs::write(dst.join("nested/file"), b"same bytes").unwrap();
+        fs::remove_file(dst.join("link")).unwrap();
+        symlink("other", dst.join("link")).unwrap();
+        assert!(!identical(&src, &dst));
+        fs::remove_file(dst.join("link")).unwrap();
+        symlink("nested/file", dst.join("link")).unwrap();
+        fs::write(dst.join("extra"), b"extra entry").unwrap();
+        assert!(!identical(&src, &dst));
+    }
+
+    #[test]
+    fn identical_shortcuts_a_shared_inode() {
+        let tmp = Tmp::new("identical-inode");
+        let src = tmp.path("src");
+        let dst = tmp.path("dst");
+        fs::write(&src, b"shared").unwrap();
+        fs::hard_link(&src, &dst).unwrap();
+
+        assert!(identical(&src, &dst));
+    }
+
+    #[test]
+    fn identical_hashes_large_files_in_bounded_chunks() {
+        let tmp = Tmp::new("identical-large");
+        let src = tmp.path("src");
+        let dst = tmp.path("dst");
+        let contents = vec![0x5a; 256 * 1024 + 17];
+        fs::write(&src, &contents).unwrap();
+        fs::write(&dst, &contents).unwrap();
+
+        assert!(identical(&src, &dst));
+    }
+
+    #[test]
+    fn identical_refuses_symlinked_directory_aliases() {
+        let tmp = Tmp::new("identical-dir-alias");
+        let src = tmp.path("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("keep"), b"keep").unwrap();
+        symlink("src", tmp.path("dst")).unwrap();
+
+        assert!(!identical(&src, &tmp.path("dst")));
     }
 
     /// The source is classified by `d_type` and opened some syscalls later.

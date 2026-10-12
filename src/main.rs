@@ -97,8 +97,8 @@ struct Paste {
     name: Option<String>,
 
     /// what to do when a destination file already exists.
-    #[argh(option, default = "Policy::Skip", from_str_fn(parse_policy))]
-    on_conflict: Policy,
+    #[argh(option, from_str_fn(parse_policy))]
+    on_conflict: Option<Policy>,
 }
 
 #[derive(FromArgs)]
@@ -228,7 +228,7 @@ fn main() -> ExitCode {
         Command::Paste(p) => do_paste(
             &clipboard,
             p.directory.as_deref().unwrap_or(Path::new(".")),
-            p.on_conflict,
+            p.on_conflict.unwrap_or_else(Policy::default_for_terminal),
         ),
         Command::List(_) => do_list(&clipboard),
     };

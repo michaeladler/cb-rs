@@ -65,15 +65,26 @@ pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, 
 
     // Pasting into the folder the source already lives in. `renameat2` reports
     // `EXIST`, and with `--on-conflict replace` that would empty the source
-    // before a rename that then does nothing.
+    // before a rename that then does nothing. A file hard-linked at destination
+    // is already there; unlink only source name.
     if walk::same_file(src, &dst).unwrap_or(false) {
-        return Ok(Outcome::Skipped);
+        let is_directory = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| {
+            rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory
+        });
+        if is_directory || same_parent(src, &dst) {
+            return Ok(Outcome::Skipped);
+        }
+        return retire_identical_source(src, &dst);
     }
     // Pasting a directory into its own subtree: `rename` answers `EINVAL`, which
     // must not be read as "no renameat2 here" and turned into a copy-then-delete
     // that copies the source into itself until the disk fills.
     if walk::inside_source(src, &dst).unwrap_or(false) {
         return Err(one(src, Errno::INVAL));
+    }
+    // Avoid replacing identical destination data.
+    if walk::identical(src, &dst) {
+        return retire_identical_source(src, &dst);
     }
 
     match rename_noreplace(src, &dst) {
@@ -134,6 +145,10 @@ fn remove_moved_source(src: &Path, walked: &Walked) -> Result<Outcome, Vec<Failu
             })
             .collect());
     }
+    retire_source(src)
+}
+
+fn retire_source(src: &Path) -> Result<Outcome, Vec<Failure>> {
     match walk::remove_any(src) {
         Ok(()) => Ok(Outcome::Moved),
         Err(e) => Ok(Outcome::MovedWithLeftover(Failure {
@@ -141,6 +156,27 @@ fn remove_moved_source(src: &Path, walked: &Walked) -> Result<Outcome, Vec<Failu
             reason: format!("moved, but the source could not be removed whole: {e}"),
         })),
     }
+}
+
+fn retire_identical_source(src: &Path, dst: &Path) -> Result<Outcome, Vec<Failure>> {
+    walk::sync_tree(dst).map_err(|e| one(src, e))?;
+    sync_parent(dst).map_err(|e| one(src, e))?;
+    retire_source(src)
+}
+
+fn same_parent(a: &Path, b: &Path) -> bool {
+    let parent = |path: &Path| {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        parent.canonicalize()
+    };
+    a.file_name() == b.file_name()
+        && parent(a)
+            .ok()
+            .zip(parent(b).ok())
+            .is_some_and(|(a, b)| a == b)
 }
 
 /// Copy `src` into `dst_dir`, like [`move_into`] but leaving the source alone.
@@ -479,6 +515,42 @@ mod tests {
 
         assert_eq!(fs::read(&dst).unwrap(), b"new");
         assert!(!src.exists());
+    }
+
+    #[test]
+    fn move_consumes_an_identical_source_without_replacing_destination() {
+        let tmp = Tmp::new("identical-move");
+        let src_dir = tmp.0.join("src-dir");
+        fs::create_dir(&src_dir).unwrap();
+        let src = src_dir.join("file");
+        let dst_dir = tmp.0.join("dst");
+        fs::create_dir(&dst_dir).unwrap();
+        fs::write(&src, b"same contents").unwrap();
+        let dst = dst_dir.join("file");
+        fs::write(&dst, b"same contents").unwrap();
+
+        assert_eq!(move_into(&src, &dst_dir, Policy::Skip), Ok(Outcome::Moved));
+
+        assert!(!src.exists());
+        assert_eq!(fs::read(&dst).unwrap(), b"same contents");
+    }
+
+    #[test]
+    fn move_consumes_a_hardlink_already_at_destination() {
+        let tmp = Tmp::new("identical-hardlink-move");
+        let src_dir = tmp.0.join("src-dir");
+        let dst_dir = tmp.0.join("dst-dir");
+        fs::create_dir(&src_dir).unwrap();
+        fs::create_dir(&dst_dir).unwrap();
+        let src = src_dir.join("file");
+        let dst = dst_dir.join("file");
+        fs::write(&src, b"shared").unwrap();
+        fs::hard_link(&src, &dst).unwrap();
+
+        assert_eq!(move_into(&src, &dst_dir, Policy::Skip), Ok(Outcome::Moved));
+
+        assert!(!src.exists());
+        assert_eq!(fs::read(&dst).unwrap(), b"shared");
     }
 
     /// The destination used to be emptied before the rename, so a rename that

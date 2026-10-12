@@ -286,6 +286,22 @@ fn amend_accumulates_a_move_and_a_copy_into_one_paste() {
     );
 }
 
+#[test]
+fn nonterminal_stdin_skips_existing_destination_by_default() {
+    let sandbox = Sandbox::new("terminal-default");
+    sandbox.ok(&["cut", "moved.txt"]);
+    std::fs::write(sandbox.root.join("out/moved.txt"), b"old").unwrap();
+
+    let output = sandbox.run(&["paste", "-d", "../out"]);
+
+    assert!(output.status.success());
+    assert!(sandbox.work("moved.txt"), "nonterminal stdin must decline");
+    assert_eq!(
+        std::fs::read(sandbox.root.join("out/moved.txt")).unwrap(),
+        b"old"
+    );
+}
+
 /// "more" is only true when there was something to add to, so amending an
 /// empty clipboard does not claim it added to one.
 #[test]
