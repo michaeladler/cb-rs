@@ -19,7 +19,7 @@ session=cb-demo-$$
 # progress bar after DELAY, so the copy has to be slow enough to see, and a
 # tmpfs copy of the same bytes finishes before the bar ever appears.
 work=$(mktemp -d "$root/.demo.XXXXXX")
-trap 'tmux kill-session -t "$session" 2>/dev/null || true; rm -rf "$work" /tmp/cb-demo-state' EXIT
+trap 'tmux -L "$session" kill-session -t "$session" 2>/dev/null || true; rm -rf "$work" /tmp/cb-demo-state' EXIT
 mkdir -p "$out" "$work/home"
 export HOME=$work/home
 # A fixed, short state path keeps `cb list` output readable in the demo.
@@ -56,10 +56,14 @@ dd if=/dev/zero of="$demo/images/raw/photo.bin" bs=1M count=1 seek=1024 conv=not
 # every machine; asciinema then records without touching a real terminal. The
 # pane command goes through bash, since a non-bash default shell aborts the
 # chain when the recording exits non-zero.
-tmux new-session -d -s "$session" -x "$cols" -y "$rows" \
+#
+# -L gives the run its own tmux server. A reused server hands the pane its own
+# global environment instead of ours, and the demo then runs against the real
+# HOME, PATH and clipboard dir instead of the hermetic fixture.
+tmux -L "$session" new-session -d -s "$session" -x "$cols" -y "$rows" \
     "bash -c 'asciinema rec --headless --return --overwrite --window-size ${cols}x${rows} --idle-time-limit 2 --title cb-rs --command \"bash $root/scripts/demo-steps.bash\" $out/demo.cast; echo \$? > $work/rec.rc'"
 
-while tmux has-session -t "$session" 2>/dev/null; do sleep 0.2; done
+while tmux -L "$session" has-session -t "$session" 2>/dev/null; do sleep 0.2; done
 # A failed demo step is a broken demo, not a broken recording.
 test "$(cat "$work/rec.rc" 2>/dev/null)" = 0 || {
                                                   echo "demo steps failed" >&2
