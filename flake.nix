@@ -50,6 +50,7 @@
                   ./src
                   ./tests
                   ./share
+                  ./.cargo/config.toml
                   ./Cargo.toml
                   ./Cargo.lock
                   ./deny.toml
