@@ -1,0 +1,40 @@
+
+[1m== local: ext4 -> ext4[0m
+fixture: 20000 small files, 512 MiB single file
+copy+paste  small cb-rs      6143 ms   min   6050   recorded, 20000 files
+copy+paste  small cb         1580 ms   min   1569   20000 files
+copy+paste  big cb-rs        1261 ms   min   1226   recorded, 1 files
+copy+paste  big cb            342 ms   min    341   1 files
+--- cut+paste small -> /home/runner/bench/cut_r
+cut+paste   small cb-rs         8 ms   min      7   20000 files
+cut+paste   small cb         2188 ms   min   2135   20000 files
+--- cut+paste big -> /home/runner/bench/cut_r
+cut+paste   big cb-rs           3 ms   min      3   1 files
+cut+paste   big cb            451 ms   min    426   1 files
+
+[1m== cross-fs: ext4 -> btrfs[0m
+copy+paste  512M cb-rs       2014 ms   min   1954   1 files
+copy+paste  512M cb           638 ms   min    633   1 files
+copy+paste  4k x4000 cb-rs    2507 ms   min   2089   4000 files
+copy+paste  4k x4000 cb       411 ms   min    398   4000 files
+
+[1m== cross-fs cut+paste: ext4 -> btrfs[0m
+--- cut+paste x -> /home/runner/work/cb-rs/cb-rs/mount-btrfs/bench/d_r
+cut+paste   x cb-rs          2090 ms   min   2054   1 files
+cut+paste   x cb              735 ms   min    724   1 files
+--- cut+paste y -> /home/runner/work/cb-rs/cb-rs/mount-btrfs/bench/d_r
+cut+paste   y cb-rs          1843 ms   min   1667   4000 files
+cut+paste   y cb              544 ms   min    542   4000 files
+
+[1m== reflink: btrfs -> btrfs[0m
+copy+paste  512M cb-rs          6 ms   min      6   1 files
+copy+paste  512M cb          1008 ms   min   1000   1 files
+
+[1m== retention: 5 copy+paste round trips, nothing emptied in between[0m
+copy+paste x5 cb-rs  7608 ms   min 7608 ms   clipboard now holds cb-rs 16K    cb 32K   
+copy+paste x5 cb     10064 ms   min 10064 ms   clipboard now holds cb-rs 4.0K   cb 2.6G  
+
+[1m== space[0m
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   62G   84G  43% /
+/dev/loop0       10G  1.1G  8.5G  11% /home/runner/work/cb-rs/cb-rs/mount-btrfs

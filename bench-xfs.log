@@ -1,0 +1,40 @@
+
+[1m== local: ext4 -> ext4[0m
+fixture: 20000 small files, 512 MiB single file
+copy+paste  small cb-rs      8146 ms   min   7651   recorded, 20000 files
+copy+paste  small cb          719 ms   min    682   20000 files
+copy+paste  big cb-rs        2797 ms   min   2713   recorded, 1 files
+copy+paste  big cb            325 ms   min    324   1 files
+--- cut+paste small -> /home/runner/bench/cut_r
+cut+paste   small cb-rs        24 ms   min     24   20000 files
+cut+paste   small cb          999 ms   min    997   20000 files
+--- cut+paste big -> /home/runner/bench/cut_r
+cut+paste   big cb-rs           2 ms   min      2   1 files
+cut+paste   big cb            412 ms   min    405   1 files
+
+[1m== cross-fs: ext4 -> xfs[0m
+copy+paste  512M cb-rs       2940 ms   min   2162   1 files
+copy+paste  512M cb           278 ms   min    277   1 files
+copy+paste  4k x4000 cb-rs    2366 ms   min   2017   4000 files
+copy+paste  4k x4000 cb       162 ms   min    156   4000 files
+
+[1m== cross-fs cut+paste: ext4 -> xfs[0m
+--- cut+paste x -> /home/runner/work/cb-rs/cb-rs/mount-xfs/bench/d_r
+cut+paste   x cb-rs          2380 ms   min   2236   1 files
+cut+paste   x cb              350 ms   min    346   1 files
+--- cut+paste y -> /home/runner/work/cb-rs/cb-rs/mount-xfs/bench/d_r
+cut+paste   y cb-rs          2314 ms   min   2110   4000 files
+cut+paste   y cb              225 ms   min    214   4000 files
+
+[1m== reflink: xfs -> xfs[0m
+copy+paste  512M cb-rs          4 ms   min      3   1 files
+copy+paste  512M cb           237 ms   min    236   1 files
+
+[1m== retention: 5 copy+paste round trips, nothing emptied in between[0m
+copy+paste x5 cb-rs  14893 ms   min 14893 ms   clipboard now holds cb-rs 16K    cb 32K   
+copy+paste x5 cb     12871 ms   min 12871 ms   clipboard now holds cb-rs 4.0K   cb 2.6G  
+
+[1m== space[0m
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   61G   84G  43% /
+/dev/loop0       10G  1.3G  8.8G  13% /home/runner/work/cb-rs/cb-rs/mount-xfs
