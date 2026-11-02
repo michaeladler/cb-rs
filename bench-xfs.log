@@ -1,0 +1,40 @@
+
+[1m== local: ext4 -> ext4[0m
+fixture: 20000 small files, 512 MiB single file
+copy+paste  small cb-rs      5877 ms   min   5486   recorded, 20000 files
+copy+paste  small cb         1549 ms   min   1530   20000 files
+copy+paste  big cb-rs        1267 ms   min   1260   recorded, 1 files
+copy+paste  big cb            336 ms   min    335   1 files
+--- cut+paste small -> /home/runner/bench/cut_r
+cut+paste   small cb-rs         7 ms   min      5   20000 files
+cut+paste   small cb         2162 ms   min   2136   rc -9
+--- cut+paste big -> /home/runner/bench/cut_r
+cut+paste   big cb-rs           2 ms   min      2   1 files
+cut+paste   big cb            414 ms   min    409   1 files
+
+[1m== cross-fs: ext4 -> xfs[0m
+copy+paste  512M cb-rs       1446 ms   min   1347   1 files
+copy+paste  512M cb           286 ms   min    258   1 files
+copy+paste  4k x4000 cb-rs    1882 ms   min   1229   4000 files
+copy+paste  4k x4000 cb       359 ms   min    354   4000 files
+
+[1m== cross-fs cut+paste: ext4 -> xfs[0m
+--- cut+paste x -> /home/runner/work/cb-rs/cb-rs/mount-xfs/bench/d_r
+cut+paste   x cb-rs          1398 ms   min   1382   1 files
+cut+paste   x cb              335 ms   min    333   1 files
+--- cut+paste y -> /home/runner/work/cb-rs/cb-rs/mount-xfs/bench/d_r
+cut+paste   y cb-rs          2014 ms   min   1475   4000 files
+cut+paste   y cb              495 ms   min    492   4000 files
+
+[1m== reflink: xfs -> xfs[0m
+copy+paste  512M cb-rs          4 ms   min      3   1 files
+copy+paste  512M cb           179 ms   min    176   1 files
+
+[1m== retention: 5 copy+paste round trips, nothing emptied in between[0m
+copy+paste x5 cb-rs  6616 ms   min 6616 ms   clipboard now holds cb-rs 16K    cb 32K   
+copy+paste x5 cb     10386 ms   min 10386 ms   clipboard now holds cb-rs 4.0K   cb 2.6G  
+
+[1m== space[0m
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   61G   84G  43% /
+/dev/loop0       10G  1.3G  8.8G  13% /home/runner/work/cb-rs/cb-rs/mount-xfs

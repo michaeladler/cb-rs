@@ -1,0 +1,40 @@
+
+[1m== local: ext4 -> ext4[0m
+fixture: 20000 small files, 512 MiB single file
+copy+paste  small cb-rs      5747 ms   min   5451   recorded, 20000 files
+copy+paste  small cb         1564 ms   min   1552   20000 files
+copy+paste  big cb-rs        1267 ms   min   1242   recorded, 1 files
+copy+paste  big cb            330 ms   min    328   1 files
+--- cut+paste small -> /home/runner/bench/cut_r
+cut+paste   small cb-rs         7 ms   min      7   20000 files
+cut+paste   small cb         2155 ms   min   2150   20000 files
+--- cut+paste big -> /home/runner/bench/cut_r
+cut+paste   big cb-rs           3 ms   min      2   1 files
+cut+paste   big cb            419 ms   min    414   1 files
+
+[1m== cross-fs: ext4 -> btrfs[0m
+copy+paste  512M cb-rs       1968 ms   min   1906   1 files
+copy+paste  512M cb           618 ms   min    614   1 files
+copy+paste  4k x4000 cb-rs    2249 ms   min   1795   4000 files
+copy+paste  4k x4000 cb       404 ms   min    403   4000 files
+
+[1m== cross-fs cut+paste: ext4 -> btrfs[0m
+--- cut+paste x -> /home/runner/work/cb-rs/cb-rs/mount-btrfs/bench/d_r
+cut+paste   x cb-rs          2061 ms   min   1997   1 files
+cut+paste   x cb              713 ms   min    710   1 files
+--- cut+paste y -> /home/runner/work/cb-rs/cb-rs/mount-btrfs/bench/d_r
+cut+paste   y cb-rs          1847 ms   min   1629   4000 files
+cut+paste   y cb              533 ms   min    526   4000 files
+
+[1m== reflink: btrfs -> btrfs[0m
+copy+paste  512M cb-rs          6 ms   min      6   1 files
+copy+paste  512M cb          1124 ms   min    993   1 files
+
+[1m== retention: 5 copy+paste round trips, nothing emptied in between[0m
+copy+paste x5 cb-rs  8324 ms   min 8324 ms   clipboard now holds cb-rs 16K    cb 32K   
+copy+paste x5 cb     9015 ms   min 9015 ms   clipboard now holds cb-rs 4.0K   cb 2.6G  
+
+[1m== space[0m
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   63G   83G  44% /
+/dev/loop0       10G  1.4G  8.2G  15% /home/runner/work/cb-rs/cb-rs/mount-btrfs
