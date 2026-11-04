@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use argh::FromArgs;
@@ -207,6 +207,7 @@ fn main() -> ExitCode {
             Ok(()) => record(
                 &clipboard,
                 clipboard.copies(),
+                clipboard.copies_base(),
                 &c.paths,
                 c.amend,
                 "copy",
@@ -218,6 +219,7 @@ fn main() -> ExitCode {
             Ok(()) => record(
                 &clipboard,
                 clipboard.originals(),
+                clipboard.originals_base(),
                 &c.paths,
                 c.amend,
                 "cut",
@@ -269,11 +271,18 @@ fn absolute_source(item: &Path) -> std::io::Result<PathBuf> {
 fn record(
     clipboard: &Clipboard,
     file: PathBuf,
+    base_file: PathBuf,
     items: &[PathBuf],
     amend: bool,
     verb: &str,
     future: &str,
 ) -> Result<(), String> {
+    // Paste rebuilds each source's path below this directory. Canonical, since
+    // `absolute_source` canonicalizes every source's parent: a base carrying a
+    // symlink would never prefix a recorded source on macOS, where /tmp is one.
+    let base = std::env::current_dir()
+        .and_then(|cwd| cwd.canonicalize())
+        .ok();
     let mut sources = Vec::with_capacity(items.len());
     let mut errors = Vec::new();
     for item in items {
@@ -315,6 +324,16 @@ fn record(
     clipboard
         .write_list(&file, &list)
         .map_err(|e| e.to_string())?;
+    // Keep the base an amended list was recorded against; only a reset or an
+    // older clipboard without one takes today's directory. Written after the
+    // list so a failure cannot remap entries that were already recorded.
+    if clipboard.read_list(&base_file).is_empty()
+        && let Some(base) = &base
+    {
+        clipboard
+            .write_list(&base_file, std::slice::from_ref(base))
+            .map_err(|e| e.to_string())?;
+    }
 
     for error in &errors {
         eprintln!("cb: {error}");
@@ -333,13 +352,21 @@ fn record(
     }
 }
 
+/// One recorded list and the directory its sources were recorded from. `base`
+/// is `None` for a clipboard written before bases were recorded: paste then
+/// falls back to each source's own name, as it always did.
+struct Recorded {
+    sources: Vec<PathBuf>,
+    base: Option<PathBuf>,
+}
+
 fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(), String> {
     // The lock covers only reading the lists. Holding it across the paste would
     // block every other `cb` command for the length of the copy; the rewrite
     // that consumes a move goes through `Clipboard::consume`, which takes the
     // lock again and merges consumed paths into any newer list.
     let (moves, copies) = read_lists(clipboard)?;
-    if moves.is_empty() && copies.is_empty() {
+    if moves.sources.is_empty() && copies.sources.is_empty() {
         println!("clipboard is empty");
         return Ok(());
     }
@@ -349,10 +376,10 @@ fn do_paste(clipboard: &Clipboard, dst_dir: &Path, policy: Policy) -> Result<(),
         return Err(format!("{}: {e}", dst_dir.display()));
     }
     let mut result = Ok(());
-    if !moves.is_empty() {
+    if !moves.sources.is_empty() {
         result = paste_moves(clipboard, dst_dir, policy, &moves);
     }
-    if !copies.is_empty()
+    if !copies.sources.is_empty()
         && let Err(e) = paste_copies(dst_dir, policy, &copies)
     {
         result = Err(e);
@@ -366,14 +393,23 @@ fn paste_moves(
     clipboard: &Clipboard,
     dst_dir: &Path,
     policy: Policy,
-    sources: &[PathBuf],
+    recorded: &Recorded,
 ) -> Result<(), String> {
     let mut remaining = Vec::new();
     let mut moved = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
-    for source in sources {
-        let outcome = mover::move_into(source, dst_dir, policy);
+    for source in &recorded.sources {
+        let dst = match prepare_destination(dst_dir, source, recorded.base.as_deref()) {
+            Ok(dst) => dst,
+            Err(failure) => {
+                eprintln!("cb: {}: {}", failure.path.display(), failure.reason);
+                remaining.push(source.clone());
+                failed += 1;
+                continue;
+            }
+        };
+        let outcome = mover::move_to(source, &dst, policy);
         if stays_recorded(&outcome) {
             remaining.push(source.clone());
         }
@@ -393,14 +429,15 @@ fn paste_moves(
             }
         }
     }
-    let consume_error = match clipboard.consume(&clipboard.originals(), sources, &remaining) {
-        Ok(true) => None,
-        Ok(false) => {
-            eprintln!("cb: clipboard changed during paste, merged consumed paths");
-            None
-        }
-        Err(e) => Some(e.to_string()),
-    };
+    let consume_error =
+        match clipboard.consume(&clipboard.originals(), &recorded.sources, &remaining) {
+            Ok(true) => None,
+            Ok(false) => {
+                eprintln!("cb: clipboard changed during paste, merged consumed paths");
+                None
+            }
+            Err(e) => Some(e.to_string()),
+        };
     if skipped > 0 {
         println!("skipped {skipped} existing item(s)");
     }
@@ -429,18 +466,66 @@ fn stays_recorded(outcome: &Result<mover::Outcome, Vec<Failure>>) -> bool {
     matches!(outcome, Err(_) | Ok(mover::Outcome::Skipped))
 }
 
+/// Where `source` lands under `dst_dir`: the path it had below the directory the
+/// copy or cut ran in, so `a/b/c.md` pastes as `a/b/c.md`, not just `c.md`.
+fn prepare_destination(
+    dst_dir: &Path,
+    source: &Path,
+    base: Option<&Path>,
+) -> Result<PathBuf, Failure> {
+    let relative = relative_destination(source, base).ok_or_else(|| Failure {
+        path: source.to_path_buf(),
+        reason: "no file name".to_owned(),
+    })?;
+    let dst = dst_dir.join(relative);
+    // `mkdir -p`, so the recorded hierarchy can be rebuilt. A file in the way
+    // fails here, naming the directory rather than the source that triggered it.
+    if let Some(parent) = dst.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return Err(Failure {
+            path: parent.to_path_buf(),
+            reason: e.to_string(),
+        });
+    }
+    Ok(dst)
+}
+
+fn relative_destination(source: &Path, base: Option<&Path>) -> Option<PathBuf> {
+    // Only a plain suffix below the recording directory is a hierarchy. `..`
+    // cannot appear there because both sides are canonical, but a base that is
+    // not a prefix (an absolute path, or one from another directory) must fall
+    // back to the name rather than escape the destination.
+    if let Some(relative) = base.and_then(|base| source.strip_prefix(base).ok())
+        && !relative.as_os_str().is_empty()
+        && relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Some(relative.to_path_buf());
+    }
+    source.file_name().map(PathBuf::from)
+}
+
 /// Copies do not consume the clipboard, so a second paste reads the same sources
 /// again. That is only sound because the source is read at paste time and not
 /// snapshotted at copy time.
-fn paste_copies(dst_dir: &Path, policy: Policy, sources: &[PathBuf]) -> Result<(), String> {
+fn paste_copies(dst_dir: &Path, policy: Policy, recorded: &Recorded) -> Result<(), String> {
     let mut failures = Vec::new();
     let mut skipped = 0usize;
     let mut pasted = 0usize;
-    for source in sources {
+    for source in &recorded.sources {
+        let dst = match prepare_destination(dst_dir, source, recorded.base.as_deref()) {
+            Ok(dst) => dst,
+            Err(failure) => {
+                failures.push(failure);
+                continue;
+            }
+        };
         // Staged and renamed in, so a destination that appears between the check
         // above the copy and the write below it is declined or replaced whole
         // rather than merged into.
-        match mover::copy_into(source, dst_dir, policy) {
+        match mover::copy_to(source, &dst, policy) {
             // A copy consumes nothing, so there is no source left to remove.
             Ok(mover::CopyOutcome::Copied) => pasted += 1,
             Ok(mover::CopyOutcome::Skipped) => skipped += 1,
@@ -453,20 +538,31 @@ fn paste_copies(dst_dir: &Path, policy: Policy, sources: &[PathBuf]) -> Result<(
     report(pasted, &failures, "pasted")
 }
 
-fn read_lists(clipboard: &Clipboard) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+fn read_lists(clipboard: &Clipboard) -> Result<(Recorded, Recorded), String> {
     let _lock = clipboard.lock().map_err(|e| e.to_string())?;
     Ok((
-        clipboard.read_list(&clipboard.originals()),
-        clipboard.read_list(&clipboard.copies()),
+        read_recorded(
+            clipboard,
+            &clipboard.originals(),
+            &clipboard.originals_base(),
+        ),
+        read_recorded(clipboard, &clipboard.copies(), &clipboard.copies_base()),
     ))
+}
+
+fn read_recorded(clipboard: &Clipboard, file: &Path, base_file: &Path) -> Recorded {
+    Recorded {
+        sources: clipboard.read_list(file),
+        base: clipboard.read_list(base_file).into_iter().next(),
+    }
 }
 
 fn do_list(clipboard: &Clipboard) -> Result<(), String> {
     let (moves, copies) = read_lists(clipboard)?;
-    for source in moves {
+    for source in moves.sources {
         println!("cut\t{}", source.display());
     }
-    for source in copies {
+    for source in copies.sources {
         println!("copy\t{}", source.display());
     }
     Ok(())
@@ -515,6 +611,31 @@ mod tests {
             ["-n", "probe", "-d", "/tmp", "-an", "-weird", "-évalue"]
                 .map(str::to_owned)
                 .to_vec()
+        );
+    }
+
+    #[test]
+    fn a_nested_source_keeps_the_path_below_the_recording_directory() {
+        let base = Path::new("/work");
+        let nested = PathBuf::from("a/b/c.md");
+
+        assert_eq!(
+            relative_destination(Path::new("/work/a/b/c.md"), Some(base)),
+            Some(nested)
+        );
+        assert_eq!(
+            relative_destination(Path::new("/work/c.md"), Some(base)),
+            Some(PathBuf::from("c.md"))
+        );
+        assert_eq!(
+            relative_destination(Path::new("/elsewhere/c.md"), Some(base)),
+            Some(PathBuf::from("c.md")),
+            "a source outside the recording directory keeps its name"
+        );
+        assert_eq!(
+            relative_destination(Path::new("/work/a/b/c.md"), None),
+            Some(PathBuf::from("c.md")),
+            "an old clipboard has no base and keeps the old behavior"
         );
     }
 
