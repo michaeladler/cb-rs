@@ -1,0 +1,40 @@
+
+[1m== local: ext4 -> ext4[0m
+fixture: 20000 small files, 512 MiB single file
+copy+paste  small cb-rs      4703 ms   min   4358   recorded, 20000 files
+copy+paste  small cb          769 ms   min    752   20000 files
+copy+paste  big cb-rs        1274 ms   min   1230   recorded, 1 files
+copy+paste  big cb            332 ms   min    329   1 files
+--- cut+paste small -> /home/runner/bench/cut_r
+cut+paste   small cb-rs         6 ms   min      6   20000 files
+cut+paste   small cb         1038 ms   min   1035   20000 files
+--- cut+paste big -> /home/runner/bench/cut_r
+cut+paste   big cb-rs           2 ms   min      2   1 files
+cut+paste   big cb            421 ms   min    402   1 files
+
+[1m== cross-fs: ext4 -> btrfs[0m
+copy+paste  512M cb-rs       1567 ms   min   1539   1 files
+copy+paste  512M cb           675 ms   min    469   1 files
+copy+paste  4k x4000 cb-rs    1537 ms   min   1223   4000 files
+copy+paste  4k x4000 cb       226 ms   min    220   4000 files
+
+[1m== cross-fs cut+paste: ext4 -> btrfs[0m
+--- cut+paste x -> /home/runner/work/cb-rs/cb-rs/mount-btrfs/bench/d_r
+cut+paste   x cb-rs          1700 ms   min   1646   1 files
+cut+paste   x cb              533 ms   min    527   1 files
+--- cut+paste y -> /home/runner/work/cb-rs/cb-rs/mount-btrfs/bench/d_r
+cut+paste   y cb-rs          1121 ms   min    796   4000 files
+cut+paste   y cb              282 ms   min    282   rc -9
+
+[1m== reflink: btrfs -> btrfs[0m
+copy+paste  512M cb-rs          3 ms   min      3   !! expected 1 files, found 0
+copy+paste  512M cb           608 ms   min    603   1 files
+
+[1m== retention: 5 copy+paste round trips, nothing emptied in between[0m
+copy+paste x5 cb-rs  6814 ms   min 6814 ms   clipboard now holds cb-rs 20K    cb 32K   
+copy+paste x5 cb     9958 ms   min 9958 ms   clipboard now holds cb-rs 4.0K   cb 2.6G  
+
+[1m== space[0m
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   60G   85G  42% /
+/dev/loop0       10G  521M  9.0G   6% /home/runner/work/cb-rs/cb-rs/mount-btrfs
