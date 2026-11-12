@@ -267,38 +267,25 @@ impl Drop for Sandbox {
 }
 
 #[test]
-fn nested_relative_paths_keep_their_hierarchy_on_paste() {
-    let sandbox = Sandbox::new("hierarchy");
-    std::fs::create_dir_all(sandbox.root.join("work/a/b")).unwrap();
-    std::fs::write(sandbox.root.join("work/a/b/c.md"), b"c").unwrap();
+fn nested_inputs_paste_under_their_file_names() {
+    for verb in ["copy", "cut"] {
+        let sandbox = Sandbox::new(&format!("basename-{verb}"));
+        std::fs::create_dir_all(sandbox.root.join("work/a/b")).unwrap();
+        std::fs::write(sandbox.root.join("work/a/b/c.md"), b"c").unwrap();
 
-    sandbox.ok(&["copy", "a/b/c.md"]);
-    sandbox.ok(&["paste", "-d", "../out"]);
+        sandbox.ok(&[verb, "a/b/c.md"]);
+        sandbox.ok(&["paste", "-d", "../out"]);
 
-    assert_eq!(
-        std::fs::read(sandbox.root.join("out/a/b/c.md")).unwrap(),
-        b"c"
-    );
-    assert!(
-        !sandbox.out("c.md"),
-        "the file name alone must not replace the recorded hierarchy"
-    );
-}
-
-#[test]
-fn nested_relative_paths_keep_their_hierarchy_on_a_move() {
-    let sandbox = Sandbox::new("hierarchy-cut");
-    std::fs::create_dir_all(sandbox.root.join("work/a/b")).unwrap();
-    std::fs::write(sandbox.root.join("work/a/b/c.md"), b"c").unwrap();
-
-    sandbox.ok(&["cut", "a/b/c.md"]);
-    sandbox.ok(&["paste", "-d", "../out"]);
-
-    assert!(!sandbox.work("a/b/c.md"));
-    assert_eq!(
-        std::fs::read(sandbox.root.join("out/a/b/c.md")).unwrap(),
-        b"c"
-    );
+        assert_eq!(
+            std::fs::read(sandbox.root.join("out/c.md")).unwrap(),
+            b"c",
+            "{verb} must paste the file under its name"
+        );
+        assert!(
+            !sandbox.out("a"),
+            "{verb} must not rebuild the directories above the source"
+        );
+    }
 }
 
 #[test]

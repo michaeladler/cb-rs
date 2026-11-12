@@ -48,50 +48,52 @@ enum CommitOutcome {
 }
 
 /// Move `src` to `dst_dir/<basename>`.
-pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, Vec<Failure>> {
-    move_to(src, &dst_dir.join(name_of(src)?), policy)
-}
-
-/// Move `src` to `dst`, creating no parent directories.
 ///
 /// Same filesystem: one `renameat2`. Different filesystems: copy to a private
 /// staging path, rename that onto the destination, and only then unlink the
 /// source. The C++ version deletes originals after a copy it never re-checked,
 /// which loses data if the copy silently came up short.
-pub fn move_to(src: &Path, dst: &Path, policy: Policy) -> Result<Outcome, Vec<Failure>> {
-    walk::clean_stale_temps_at_path(parent_dir(dst));
+pub fn move_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<Outcome, Vec<Failure>> {
+    let name = src.file_name().ok_or_else(|| {
+        vec![Failure {
+            path: src.to_path_buf(),
+            reason: "no file name".to_owned(),
+        }]
+    })?;
+    let dst = dst_dir.join(name);
+    walk::clean_stale_temps_at_path(dst_dir);
 
     // Pasting into the folder the source already lives in. `renameat2` reports
     // `EXIST`, and with `--on-conflict replace` that would empty the source
     // before a rename that then does nothing. A file hard-linked at destination
     // is already there; unlink only source name.
-    if walk::same_file(src, dst).unwrap_or(false) {
+    if walk::same_file(src, &dst).unwrap_or(false) {
         let is_directory = statat(CWD, src, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| {
             rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Directory
         });
-        if is_directory || same_parent(src, dst) {
+        if is_directory || same_parent(src, &dst) {
             return Ok(Outcome::Skipped);
         }
-        return retire_identical_source(src, dst);
+        return retire_identical_source(src, &dst);
     }
     // Pasting a directory into its own subtree: `rename` answers `EINVAL`, which
     // must not be read as "no renameat2 here" and turned into a copy-then-delete
     // that copies the source into itself until the disk fills.
-    if walk::inside_source(src, dst).unwrap_or(false) {
+    if walk::inside_source(src, &dst).unwrap_or(false) {
         return Err(one(src, Errno::INVAL));
     }
     // Avoid replacing identical destination data.
-    if walk::identical(src, dst) {
-        return retire_identical_source(src, dst);
+    if walk::identical(src, &dst) {
+        return retire_identical_source(src, &dst);
     }
 
-    match rename_noreplace(src, dst) {
+    match rename_noreplace(src, &dst) {
         Ok(()) => return Ok(Outcome::Moved),
         Err(Errno::EXIST | Errno::NOTEMPTY | Errno::ISDIR) => {
-            if !policy.resolve(dst).map_err(|e| one(src, e))? {
+            if !policy.resolve(&dst).map_err(|e| one(src, e))? {
                 return Ok(Outcome::Skipped);
             }
-            return replace_by_rename(src, dst)
+            return replace_by_rename(src, &dst)
                 .map(|()| Outcome::Moved)
                 .map_err(|e| replace_failure(src, e));
         }
@@ -108,9 +110,9 @@ pub fn move_to(src: &Path, dst: &Path, policy: Policy) -> Result<Outcome, Vec<Fa
     // A cross-device move copies into a private sibling of the destination and
     // renames that onto place, so a destination that appears while the copy
     // runs is only ever replaced by a finished tree.
-    let staged = walk::staged_path(dst).map_err(|e| one(src, e))?;
+    let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
     let walked = Walked::default();
-    match stage_and_commit(src, dst, &staged, policy, Some(&walked), None) {
+    match stage_and_commit(src, &dst, &staged, policy, Some(&walked), None) {
         Ok(CommitOutcome::Committed) => remove_moved_source(src, &walked),
         Ok(CommitOutcome::Skipped) => Ok(Outcome::Skipped),
         Err(failures) => Err(failures),
@@ -162,21 +164,6 @@ fn retire_identical_source(src: &Path, dst: &Path) -> Result<Outcome, Vec<Failur
     retire_source(src)
 }
 
-fn name_of(src: &Path) -> Result<&OsStr, Vec<Failure>> {
-    src.file_name().ok_or_else(|| {
-        vec![Failure {
-            path: src.to_path_buf(),
-            reason: "no file name".to_owned(),
-        }]
-    })
-}
-
-fn parent_dir(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-}
-
 fn same_parent(a: &Path, b: &Path) -> bool {
     let parent = |path: &Path| {
         let parent = path
@@ -193,32 +180,34 @@ fn same_parent(a: &Path, b: &Path) -> bool {
 }
 
 /// Copy `src` into `dst_dir`, like [`move_into`] but leaving the source alone.
-pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<CopyOutcome, Vec<Failure>> {
-    copy_to(src, &dst_dir.join(name_of(src)?), policy)
-}
-
-/// Copy `src` to `dst`, creating no parent directories.
 ///
 /// Staged and renamed in like a move. An existing destination is approved before
 /// the copy, then re-approved only if its inode changes before commit.
-pub fn copy_to(src: &Path, dst: &Path, policy: Policy) -> Result<CopyOutcome, Vec<Failure>> {
-    walk::clean_stale_temps_at_path(parent_dir(dst));
-    if walk::same_file(src, dst).unwrap_or(false) {
+pub fn copy_into(src: &Path, dst_dir: &Path, policy: Policy) -> Result<CopyOutcome, Vec<Failure>> {
+    let name = src.file_name().ok_or_else(|| {
+        vec![Failure {
+            path: src.to_path_buf(),
+            reason: "no file name".to_owned(),
+        }]
+    })?;
+    let dst = dst_dir.join(name);
+    walk::clean_stale_temps_at_path(dst_dir);
+    if walk::same_file(src, &dst).unwrap_or(false) {
         return Ok(CopyOutcome::Skipped);
     }
-    if walk::inside_source(src, dst).unwrap_or(false) {
+    if walk::inside_source(src, &dst).unwrap_or(false) {
         return Err(vec![Failure {
             path: src.to_path_buf(),
             reason: "destination is inside the source".to_owned(),
         }]);
     }
-    let approved_dst = destination_identity(dst).map_err(|e| one(src, e))?;
-    if approved_dst.is_some() && !policy.resolve(dst).map_err(|e| one(src, e))? {
+    let approved_dst = destination_identity(&dst).map_err(|e| one(src, e))?;
+    if approved_dst.is_some() && !policy.resolve(&dst).map_err(|e| one(src, e))? {
         return Ok(CopyOutcome::Skipped);
     }
-    let staged = walk::staged_path(dst).map_err(|e| one(src, e))?;
+    let staged = walk::staged_path(&dst).map_err(|e| one(src, e))?;
     // A copy consumes nothing, so there is no source to check and nothing to record.
-    stage_and_commit(src, dst, &staged, policy, None, approved_dst).map(|outcome| match outcome {
+    stage_and_commit(src, &dst, &staged, policy, None, approved_dst).map(|outcome| match outcome {
         CommitOutcome::Committed => CopyOutcome::Copied,
         CommitOutcome::Skipped => CopyOutcome::Skipped,
     })
@@ -382,9 +371,14 @@ fn replace_by_rename(src: &Path, dst: &Path) -> Result<(), ReplaceError> {
 /// it there durable. No `NOFOLLOW`: the parent's ordinary path semantics are what
 /// the user's destination means.
 fn sync_parent(path: &Path) -> IoResult<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        // A bare name names an entry of the working directory.
+        _ => Path::new("."),
+    };
     let dir = rustix::fs::openat(
         CWD,
-        parent_dir(path),
+        parent,
         rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
         rustix::fs::Mode::empty(),
     )?;

@@ -17,8 +17,6 @@ pub const STATE_DIR: &str = "cb-rs";
 const METADATA: &str = "metadata";
 const ORIGINALS: &str = "originals";
 const COPIES: &str = "copies";
-const ORIGINALS_BASE: &str = "originals.base";
-const COPIES_BASE: &str = "copies.base";
 const LOCK: &str = "lock";
 
 /// `originals` holds what `paste` moves and `copies` what it copies; neither
@@ -51,16 +49,6 @@ impl Clipboard {
         self.root.join(METADATA).join(COPIES)
     }
 
-    /// Directory `cut` ran in, against which paste rebuilds the recorded paths.
-    pub fn originals_base(&self) -> PathBuf {
-        self.root.join(METADATA).join(ORIGINALS_BASE)
-    }
-
-    /// Directory `copy` ran in, against which paste rebuilds the recorded paths.
-    pub fn copies_base(&self) -> PathBuf {
-        self.root.join(METADATA).join(COPIES_BASE)
-    }
-
     pub fn ensure(&self) -> std::io::Result<()> {
         self.ensure_at(&state_root())
     }
@@ -79,12 +67,7 @@ impl Clipboard {
 
     /// A new copy or cut replaces the whole clipboard entry.
     pub fn reset(&self) -> std::io::Result<()> {
-        for file in [
-            self.originals(),
-            self.copies(),
-            self.originals_base(),
-            self.copies_base(),
-        ] {
+        for file in [self.originals(), self.copies()] {
             match std::fs::remove_file(file) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
